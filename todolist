@@ -1,0 +1,15 @@
+Sandbox
+    1.API HOOKING (Disabling, Man-in-the-Middle)
+    2.Flag Delay
+    3.Dumpper
+DLL
+	4.Emulator, 
+Monitor
+	5.Check Alive
+	6.API Tracing ( For detecting strange behavior like writing file, aiding unpacking, ). (Referecing BinNavy)
+
+
+1.
+Locating the issue causing false iat.
+Exception
+Command Options(-n for times, -d disable, -p process(handling params), -l log, -c crash_report)
