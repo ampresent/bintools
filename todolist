@@ -13,3 +13,5 @@ Monitor
 Locating the issue causing false iat.
 Exception
 Command Options(-n for times, -d disable, -p process(handling params), -l log, -c crash_report)
+Distinguish functions with the same name in different libraries
+DllMain
