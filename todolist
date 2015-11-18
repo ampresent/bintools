@@ -1,17 +1,14 @@
 Sandbox
-    1.API HOOKING (Disabling, Man-in-the-Middle)
-    2.Flag Delay
-    3.Dumpper
-DLL
-	4.Emulator, 
+	API Tracing ( For detecting strange behavior like writing file, aiding unpacking, ). (Referecing BinNavy)
+				( Or Analyse trace of normal input and PoC input, to lead a replay attack)
+	Logging system
+	Interactive
+Emulator
 Monitor
-	5.Check Alive
-	6.API Tracing ( For detecting strange behavior like writing file, aiding unpacking, ). (Referecing BinNavy)
+	Check Alive
 
-
-1.
-Locating the issue causing false iat.
+Allow for multiple costomizing hanlers, through config file
+Locating the issue causing false IAT. Why so many false IAT?
 Exception
 Command Options(-n for times, -d disable, -p process(handling params), -l log, -c crash_report)
 Distinguish functions with the same name in different libraries
-DllMain
