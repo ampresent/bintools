@@ -31,7 +31,7 @@ int get_single_instruction(char* bytes, char* str, size_t bufsize){
 
 int get_single_instruction_word(unsigned word, char* str, size_t bufsize){
     char bytes[4];
-    sprintf(bytes, "%c%c%c%c", word&255, (word>>8)&255, (word>>16)&255, (word>>24)&255);
+    sprintf(bytes, "%c%c%c%c", word&0xff, (word>>8)&0xff, (word>>16)&0xff, (word>>24)&0xff);
     return get_single_instruction(bytes, str, bufsize);
 }
 
@@ -60,6 +60,9 @@ int main(){
     char inst_str[128];
 
     char indirect = 0;
+    char manual = 0;
+    char plt = 1;
+    int pop = 0;
     ban = 0x0804841b;
     const char *prog = "./try";
 
@@ -96,7 +99,7 @@ int main(){
 
             backup = Ptrace(PTRACE_PEEKTEXT, pid, (void*)bp, NULL);
 
-            buff = (backup&0xffffff00u)|0xccu;
+            buff = (backup&0xffffff00)|0xCC;
 
             Ptrace(PTRACE_POKETEXT, pid, (void*)bp, (void*)buff);
             Ptrace(PTRACE_CONT, pid, NULL, NULL);
@@ -110,19 +113,33 @@ int main(){
                 Ptrace(PTRACE_SETREGS, pid, NULL, &regs);
                 // BUT THIS MAKES THE BREAKPOINT INVALID, SO WHILE NO USE!!!
                 // CORRECT THIS LATAR
-                Ptrace(PTRACE_POKETEXT, pid, (void*)bp, (void*)backup);
-                offset = 0;
+                Ptrace(PTRACE_POKETEXT, pid, (void*)regs.eip, (void*)backup);
 
-                data = Ptrace(PTRACE_PEEKTEXT, pid, (void*)(regs.eip+offset), NULL);
-                len = get_single_instruction_word(data, inst_str, 128);
-                while (strncmp(inst_str, "retn", 4) && strncmp(inst_str, "ret", 3)){
-                    offset += len;
+                if (plt || manual){
+                    backup = Ptrace(PTRACE_PEEKTEXT, pid, (void*)regs.eip, NULL);
+                    if (plt || pop==0)
+                        buff = (backup & 0x00000000) | 0xc3;
+                    else
+                        buff = (backup & 0xff000000) | 0xc2 | ((pop<<8)&0xffff00);
+                    Ptrace(PTRACE_POKETEXT, pid, (void*)regs.eip, (void*)buff);
+
+                    // DEBUG TEST
+                    data = Ptrace(PTRACE_PEEKTEXT, pid, (void*)(regs.eip), NULL);
+                    len = get_single_instruction_word(data, inst_str, 128);
+                    Ptrace(PTRACE_CONT, pid, NULL, NULL);
+                }else{
+                    offset = 0;
                     data = Ptrace(PTRACE_PEEKTEXT, pid, (void*)(regs.eip+offset), NULL);
                     len = get_single_instruction_word(data, inst_str, 128);
+                    while (strncmp(inst_str, "retn", 4) && strncmp(inst_str, "ret", 3)){
+                        offset += len;
+                        data = Ptrace(PTRACE_PEEKTEXT, pid, (void*)(regs.eip+offset), NULL);
+                        len = get_single_instruction_word(data, inst_str, 128);
+                    }
+                    regs.eip += offset;
+                    Ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+                    Ptrace(PTRACE_CONT, pid, NULL, NULL);
                 }
-                regs.eip += offset;
-                Ptrace(PTRACE_SETREGS, pid, NULL, &regs);
-                Ptrace(PTRACE_CONT, pid, NULL, NULL);
             }
             wait(&wait_status);
         }

@@ -1,8 +1,19 @@
+Priority:
+    Cross-Platform
+    Reverse-Connect shell Honney Pot.
+
 Sandbox
+    Reverse-Connect shell Honney Pot.
 	API Tracing ( For detecting strange behavior like writing file, aiding unpacking, ). (Referecing BinNavy)
 				( Or Analyse trace of normal input and PoC input, to lead a replay attack)
 	Logging system
 	Interactive
+    Interface for fuzzing framework like sulley, strike
+    Pattern Match, Return value capture for Man in the Middle
+    Sub process must be able to passed into arguments. Especially for Unix like
+    Anti-Reversing for sandox. Avoid being analysed by other hackers.
+    Linux
+        A universal solution to restore breakpoints
 Emulator
 Monitor
 	Check Alive
