@@ -1,11 +1,7 @@
 Priority:
     Cross-Platform
-    Reverse-Connect shell Honney Pot.
-
 Sandbox
-    Reverse-Connect shell Honney Pot.
-	API Tracing ( For detecting strange behavior like writing file, aiding unpacking, ). (Referecing BinNavy)
-				( Or Analyse trace of normal input and PoC input, to lead a replay attack)
+    Breakpoint for new thread
 	Logging system
 	Interactive
     Interface for fuzzing framework like sulley, strike
@@ -23,3 +19,5 @@ Locating the issue causing false IAT. Why so many false IAT?
 Exception
 Command Options(-n for times, -d disable, -p process(handling params), -l log, -c crash_report)
 Distinguish functions with the same name in different libraries
+
+Wrong to assume breakpoint at next instruction will be executed immediately, concerning threads. Anything like last_dyn will be invalid.

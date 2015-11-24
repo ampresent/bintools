@@ -115,30 +115,37 @@ int main(){
                 // CORRECT THIS LATAR
                 Ptrace(PTRACE_POKETEXT, pid, (void*)regs.eip, (void*)backup);
 
-                if (plt || manual){
-                    backup = Ptrace(PTRACE_PEEKTEXT, pid, (void*)regs.eip, NULL);
-                    if (plt || pop==0)
-                        buff = (backup & 0x00000000) | 0xc3;
-                    else
-                        buff = (backup & 0xff000000) | 0xc2 | ((pop<<8)&0xffff00);
-                    Ptrace(PTRACE_POKETEXT, pid, (void*)regs.eip, (void*)buff);
+                if (mitm){
+                    if (plt || manual){
 
-                    // DEBUG TEST
-                    data = Ptrace(PTRACE_PEEKTEXT, pid, (void*)(regs.eip), NULL);
-                    len = get_single_instruction_word(data, inst_str, 128);
-                    Ptrace(PTRACE_CONT, pid, NULL, NULL);
-                }else{
-                    offset = 0;
-                    data = Ptrace(PTRACE_PEEKTEXT, pid, (void*)(regs.eip+offset), NULL);
-                    len = get_single_instruction_word(data, inst_str, 128);
-                    while (strncmp(inst_str, "retn", 4) && strncmp(inst_str, "ret", 3)){
-                        offset += len;
+                    }else{
+
+                    }
+                }
+                else if (disable){
+                    if (plt || manual){
+                        backup = Ptrace(PTRACE_PEEKTEXT, pid, (void*)regs.eip, NULL);
+                        if (plt || pop==0)
+                            buff = (backup & 0xffffff00) | 0xc3;
+                        else
+                            buff = (backup & 0xff000000) | 0xc2 | ((pop<<8)&0xffff00);
+                        // Seems don't need to restore
+                        Ptrace(PTRACE_POKETEXT, pid, (void*)regs.eip, (void*)buff);
+                        Ptrace(PTRACE_CONT, pid, NULL, NULL);
+                    }else{
+                        // An automatic approach
+                        offset = 0;
                         data = Ptrace(PTRACE_PEEKTEXT, pid, (void*)(regs.eip+offset), NULL);
                         len = get_single_instruction_word(data, inst_str, 128);
+                        while (strncmp(inst_str, "retn", 4) && strncmp(inst_str, "ret", 3)){
+                            offset += len;
+                            data = Ptrace(PTRACE_PEEKTEXT, pid, (void*)(regs.eip+offset), NULL);
+                            len = get_single_instruction_word(data, inst_str, 128);
+                        }
+                        regs.eip += offset;
+                        Ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+                        Ptrace(PTRACE_CONT, pid, NULL, NULL);
                     }
-                    regs.eip += offset;
-                    Ptrace(PTRACE_SETREGS, pid, NULL, &regs);
-                    Ptrace(PTRACE_CONT, pid, NULL, NULL);
                 }
             }
             wait(&wait_status);

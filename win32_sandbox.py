@@ -4,24 +4,35 @@ import pefile
 import sys
 import struct
 import argparse
-import copy
+import json
+import os
 
 class sandbox():
 	def __init__(self, target, options):
-		# Only for use of disable API, to speed up
+	# Only for use of disable API, to speed up
 		# For general use, containing time to live etc.
 		self.handlers = dict()
-
+		# Instruction counters
+		self.counter = dict()
+		# Modules chosen to be visible when tracing
+		# Maybe useless when coloring IDA pro
+		self.visible_modules = []
+		self.visible_modules.append(os.path.basename(target))
+		self.module_sections = []
+		# If any trace specified
+		trace_option = filter(lambda x:x.utils=='trace', options)
+		if (trace_option):
+			self.visible_module = reduce(list.__iadd__, [x.module for x in trace_option])
+		self.trace = True
+		# Pydbg object
 		self.dbg = pydbg()
 		self.dbg.load(target)
 		self.pe = pefile.PE(target)
-
 		# Raw option
 		self.options = options
- 
 		# The reason I use -s for MITM, is MITM will not only be used on APIs. Use it for disabling too, for convience
 		for opt in self.options:
-			if not opt.search:
+			if opt.utils in ['disable', 'mitm'] and not opt.search:
 				if opt.utils=='disable':
 					handler = self.__ban_handle
 				elif opt.utils=='mitm':
@@ -35,10 +46,10 @@ class sandbox():
 						self.dbg.bp_set_hw(bp, 1, HW_EXECUTE, handler=handler)
 					else:
 						self.dbg.bp_set(bp, handler=handler)
-
 		self.oep = self.pe.OPTIONAL_HEADER.ImageBase + self.pe.OPTIONAL_HEADER.AddressOfEntryPoint
 		self.dbg.bp_set(self.oep, restore=False, handler=self.__oep_handle)
 
+	# Run the debugger
 	def run(self):
 		self.dbg.run()
 
@@ -100,12 +111,12 @@ class sandbox():
 		# Func_addr unknown yet until GetProcAddress returns
 
 		#print '[+] Forbidden API detected: %s' % func_name
-		
+
 		# Execute Until Return
 		dbg.bp_set(ret, restore=False, handler=self.__gpa_ret_handle)
 		self.last_dyn_API = func_name
 		return DBG_CONTINUE
-		
+
 	# STILL FAULTY COMPLETELY
 	'''
 	def ll_handle(dbg):
@@ -133,6 +144,7 @@ class sandbox():
 	def __handler_count_down(self, eip):
 		if self.handlers[eip].time > -1:
 			self.handlers[eip].time -= 1
+		print '[*] Handler %s\t0x%x expired' % (self.handlers[eip].name, eip)
 		if self.handlers[eip].time == 0:
 			if self.handlers[eip].type == 'hardware':
 				self.dbg.bp_del_hw(eip)
@@ -183,15 +195,30 @@ class sandbox():
 
 	def __oep_handle(self, dbg):
 		print '[*] Breaking on OEP: 0x%x' % dbg.context.Eip
-		# TWO functions: 1. Detecting forbidden API.
-		#				 2. Search for API by name
+		# Enumerate modules loaded for now
+		# MAYBE I NEED TO WATCH LOAD_LIBRARY FUNCTION NOW!!!!!
+		for module in dbg.iterate_modules():
+			if module.szModule in self.visible_modules:
+				self.module_sections.append((module.modBaseAddr, module.modBaseAddr+module.modBaseSize))
+		# Set singlestep breakpoint for trace utility
+		if self.trace:
+			dbg.set_callback(EXCEPTION_SINGLE_STEP, self.__trace_handle)
+			for thread_id in dbg.enumerate_threads():
+				print '[+] Single step for thread %d' % thread_id
+				# What's the thread used for?
+				h_thread = dbg.open_thread(thread_id)
+				dbg.single_step(True, thread_handle=h_thread)
+				dbg.close_handle(h_thread)
+			dbg.resume_all_threads()
 
+		# TWO functions:	1. Detecting forbidden API.
+		#					2. Search for API by name
 		# POSSIBLY LOAD_TIME LINKING SHOULD NOT BE PUT IN THE OEP HANDLE
 		# Load-time Dynamic Linking
 		self.__dyn_link(self.pe, self.dbg)
 		# Run-time Dynamic Linking
 		getprocaddr = self.dbg.func_resolve('kernel32.dll', 'GetProcAddress')
-		self.dbg.bp_set(getprocaddr, handler=self.__gpa_handle)
+		dbg.bp_set(getprocaddr, handler=self.__gpa_handle)
 		self.handlers[getprocaddr] = argparse.Namespace()
 		self.handlers[getprocaddr].breakpoint = getprocaddr
 		self.handlers[getprocaddr].name = 'GetProcAddress'
@@ -199,6 +226,24 @@ class sandbox():
 		# NO USE FOR NOW
 		#loadlibrary = dbg.func_resolve('kernel32.dll', 'LoadLibraryA')
 		#dbg.bp_set(loadlibrary, handler=ll_handle)
+		return DBG_CONTINUE
+
+	def __trace_handle(self, dbg):
+		eip = dbg.context.Eip
+		if eip in self.counter:
+			self.counter[eip] += 1
+		else:
+			self.counter[eip] = 1
+		# If eip is within visible modules, then break at it
+		if filter(lambda x: x[0]<=eip<=x[1], self.module_sections):
+			dbg.single_step(True)
+		# Else, break at return address
+		else:
+			esp = dbg.context.Esp
+			ret = dbg.read(esp, 4)
+			ret = struct.unpack("<I", ret)[0]
+			dbg.bp_set(ret, restore=False, handler=self.__trace_handle)
+			dbg.single_step(False)
 		return DBG_CONTINUE
 
 	def __dyn_link(self, pe, dbg):
@@ -209,7 +254,7 @@ class sandbox():
 				func_addr = struct.unpack('<I', func_addr)[0]
 
 				for opt in self.options:
-					if opt.search and func_name in opt.breakpoint:
+					if opt.utils in ['disable', 'mitm'] and opt.search and func_name in opt.breakpoint:
 						print '[+] Forbidden API detected: %s\t0x%x' % (func_name, func_addr)
 						if opt.utils == 'disable':
 							handler = self.__ban_handle
@@ -224,16 +269,15 @@ class sandbox():
 						self.handlers[func_addr].breakpoint = func_addr
 						self.handlers[func_addr].name = func_name
 
-def parse_options():
+def parse_options(args):
 	parser = argparse.ArgumentParser()
-	parser.add_argument('-b', action='store', dest='breakpoint', required=True, help='Breakpoint. Name or address, depending on -s', nargs='+')
-	parser.add_argument('-t', action='store', choices=['hardware', 'memory'], dest='type', default='memory', help='Type of breakpoint. Memory by default')
-	parser.add_argument('--no-search', action='store_false', dest='search', default=True, help='Don\'t search for the name, given by -b. Search by default')
-	parser.add_argument('--time', action='store', type=int, dest='time', default='-1', help='Time to live for the handler')
-
 	subparses = parser.add_subparsers(title='Utils', dest='utils', help='USE %(prog)s disable -h OR %(prog)s mitm -h FOR DETAILS')
 	parser_disable = subparses.add_parser('disable', help='Disable specified APIs.')
 	parser_disable.add_argument('-i', '--interactive', action='store_true', dest='interactive', default=False, help='Prompt before disabling')
+	parser_disable.add_argument('-b', action='store', dest='breakpoint', required=True, help='Breakpoint. Name or address, depending on -s', nargs='+')
+	parser_disable.add_argument('-t', action='store', choices=['hardware', 'memory'], dest='type', default='memory', help='Type of breakpoint. Memory by default')
+	parser_disable.add_argument('--no-search', action='store_false', dest='search', default=True, help='Don\'t search for the name, given by -b. Search by default')
+	parser_disable.add_argument('--time', action='store', type=int, dest='time', default='-1', help='Time to live for the handler')
 	parser_mitm = subparses.add_parser('mitm', help='Man in the Middle')
 	parser_mitm.add_argument('--indirect', action='store_true', dest='indirect', default=False, help='Indirect Address. False by default')
 	parser_mitm.add_argument('--offset', action='store', type=int, dest='offset', required=True, help='Bytes offset to the param from esp')
@@ -241,10 +285,17 @@ def parse_options():
 	parser_mitm.add_argument('--into', dest='into', required=True, help='Change bytes into')
 	parser_mitm.add_argument('--display', action='store', choices=['%s', '%d', '%l', '%x'],
 								default='%s', dest='display', help='Format of displaying')
+	parser_mitm.add_argument('-b', action='store', dest='breakpoint', required=True, help='Breakpoint. Name or address, depending on -s', nargs='+')
+	parser_mitm.add_argument('-t', action='store', choices=['hardware', 'memory'], dest='type', default='memory', help='Type of breakpoint. Memory by default')
+	parser_mitm.add_argument('--no-search', action='store_false', dest='search', default=True, help='Don\'t search for the name, given by -b. Search by default')
+	parser_mitm.add_argument('--time', action='store', type=int, dest='time', default='-1', help='Time to live for the handler')
+	parser_trace = subparses.add_parser('trace', help='Trace the execution of instructions.')
+	parser_trace.add_argument('-f', action='store', dest='file', help='Output File')
+	parser_trace.add_argument('-m', action='append', dest='module', help='Visible Modules')
 	parser.add_argument('-l', action='store', dest='log', help='Log filename. Not supported yet.')
 	parser.add_argument('-c', action='store', dest='crash-report', help='Crash report filename. Not supported yet.')
 
-	option = parser.parse_args()
+	option = parser.parse_args(args)
 
 	# MITM argument check
 	if option.utils == 'mitm':
@@ -263,7 +314,7 @@ def parse_options():
 			exit(0)
 
 	# Translate breakpoint into integer
-	if not option.search:
+	if option.utils in ['mitm', 'disable'] and not option.search:
 		for i, bp in enumerate(option.breakpoint):
 			if bp.startswith('0x'):
 				option.breakpoint[i] = int(bp[2:], 16)
@@ -272,8 +323,14 @@ def parse_options():
 	return option
 
 if __name__ == '__main__':
-	options = parse_options()
-	print options
-	a = sandbox('C:\Users\Administrator\Desktop\chopper\chopper_Plugin.exe', [options])
+	# WTF, sys.argv[0]:win32_sandbox.py???
+	options = parse_options(sys.argv[2:])
+	a = sandbox(sys.argv[1], [options])
 	a.run()
+
+	if options.file:
+		with open(options.file, 'w+') as f:
+			json.dump(a.counter, f)
+	else:
+		print map(hex, a.counter.keys())
 	print '[*] Exit'
