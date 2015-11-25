@@ -4,7 +4,7 @@ import pefile
 import sys
 import struct
 import argparse
-import json
+import pickle
 import os
 
 class sandbox():
@@ -12,8 +12,8 @@ class sandbox():
 	# Only for use of disable API, to speed up
 		# For general use, containing time to live etc.
 		self.handlers = dict()
-		# Instruction counters
-		self.counter = dict()
+		# Instruction stream
+		self.inst_stream = []
 		# Modules chosen to be visible when tracing
 		# Maybe useless when coloring IDA pro
 		self.visible_modules = []
@@ -230,10 +230,7 @@ class sandbox():
 
 	def __trace_handle(self, dbg):
 		eip = dbg.context.Eip
-		if eip in self.counter:
-			self.counter[eip] += 1
-		else:
-			self.counter[eip] = 1
+		self.inst_stream.append(eip)
 		# If eip is within visible modules, then break at it
 		if filter(lambda x: x[0]<=eip<=x[1], self.module_sections):
 			dbg.single_step(True)
@@ -330,7 +327,5 @@ if __name__ == '__main__':
 
 	if options.file:
 		with open(options.file, 'w+') as f:
-			json.dump(a.counter, f)
-	else:
-		print map(hex, a.counter.keys())
+			pickle.dump(a.inst_stream, f)
 	print '[*] Exit'
