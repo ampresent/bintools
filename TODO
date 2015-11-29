@@ -1,9 +1,10 @@
 Priority:
     Cross-Platform
+    Program like reversing.kr/ImagePrc failed to track the main part. Unless oep specified. Why?
 Sandbox
     Breakpoint for new thread
-	Logging system
-	Interactive
+    Logging system
+    Interactive
     Interface for fuzzing framework like sulley, strike
     Pattern Match, Return value capture for Man in the Middle
     Sub process must be able to passed into arguments. Especially for Unix like
@@ -12,7 +13,10 @@ Sandbox
         A universal solution to restore breakpoints
 Emulator
 Monitor
-	Check Alive
+    Check Alive
+Bomber
+Entropy character
+    Gray-box fuzzing, a ranking factor for genetic algorithm( Not for now, before thoroughly understand fuzzing )
 
 Allow for multiple costomizing hanlers, through config file
 Locating the issue causing false IAT. Why so many false IAT?

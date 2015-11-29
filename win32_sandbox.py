@@ -31,6 +31,7 @@ class sandbox():
 		# Raw option
 		self.options = options
 		# The reason I use -s for MITM, is MITM will not only be used on APIs. Use it for disabling too, for convience
+		self.oep = ''
 		for opt in self.options:
 			if opt.utils in ['disable', 'mitm'] and not opt.search:
 				if opt.utils=='disable':
@@ -46,7 +47,11 @@ class sandbox():
 						self.dbg.bp_set_hw(bp, 1, HW_EXECUTE, handler=handler)
 					else:
 						self.dbg.bp_set(bp, handler=handler)
-		self.oep = self.pe.OPTIONAL_HEADER.ImageBase + self.pe.OPTIONAL_HEADER.AddressOfEntryPoint
+
+			if opt.oep:
+				self.oep = opt.oep
+		if not self.oep:
+			self.oep = self.pe.OPTIONAL_HEADER.ImageBase + self.pe.OPTIONAL_HEADER.AddressOfEntryPoint
 		self.dbg.bp_set(self.oep, restore=False, handler=self.__oep_handle)
 
 	# Run the debugger
@@ -76,7 +81,7 @@ class sandbox():
 		func_name = self.last_dyn_API
 
 		for opt in self.options:
-			if opt.search and func_name in opt.breakpoint:
+			if opt.utils in ['disable', 'mitm'] and opt.search and func_name in opt.breakpoint:
 				if opt.utils == 'disable':
 					handler = self.__ban_handle
 				elif opt.utils == 'mitm':
@@ -239,8 +244,11 @@ class sandbox():
 			esp = dbg.context.Esp
 			ret = dbg.read(esp, 4)
 			ret = struct.unpack("<I", ret)[0]
-			dbg.bp_set(ret, restore=False, handler=self.__trace_handle)
-			dbg.single_step(False)
+
+			# WILL I MISS SOMETHING THAT STARTS IN OTHER MODULE AND END UP IN VISIBLE ONES
+			if filter(lambda x: x[0]<=ret<=x[1], self.module_sections):
+				dbg.bp_set(ret, restore=False, handler=self.__trace_handle)
+				dbg.single_step(False)
 		return DBG_CONTINUE
 
 	def __dyn_link(self, pe, dbg):
@@ -268,6 +276,7 @@ class sandbox():
 
 def parse_options(args):
 	parser = argparse.ArgumentParser()
+	parser.add_argument('--oep', action='store', dest='oep', help='Specify OEP.')
 	subparses = parser.add_subparsers(title='Utils', dest='utils', help='USE %(prog)s disable -h OR %(prog)s mitm -h FOR DETAILS')
 	parser_disable = subparses.add_parser('disable', help='Disable specified APIs.')
 	parser_disable.add_argument('-i', '--interactive', action='store_true', dest='interactive', default=False, help='Prompt before disabling')
@@ -317,6 +326,12 @@ def parse_options(args):
 				option.breakpoint[i] = int(bp[2:], 16)
 			else:
 				option.breakpoint[i] = int(bp)
+	if option.utils == 'trace':
+		if option.oep:
+			if option.oep.startswith('0x'):
+				option.oep = int(option.oep[2:], 16)
+			else:
+				option.eop = int(option.oep)
 	return option
 
 if __name__ == '__main__':
