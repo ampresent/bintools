@@ -10,6 +10,8 @@
 #include <limits.h>
 
 #define OFFSET_OEP        24
+#define OFFSET_BASEADDR   0x7c
+#define OFFSET_MEMSIZE    0x88
 #define MAX_MODULES       128
 
 #define UTILITY_TYPE      unsigned
@@ -52,7 +54,6 @@ unsigned priorityarray[] = {
 #define GETID(ip) ((ip)&((MAX_HASH)-1))
 
 struct Module{
-    char* module_name;
     unsigned base;
     unsigned length;
     struct Module* next_module;
@@ -118,17 +119,32 @@ unsigned get_entry_point(const char * filename){
     return oep;
 }
 
+unsigned get_baseaddr(const char * filename){
+    FILE* file;
+    unsigned res = 0;
+    file = fopen(filename, "r");
+    fseek(file, OFFSET_BASEADDR, SEEK_SET);
+    fread(&res, 4, 1, file);
+    fclose(file);
+    return res;
+}
+
+unsigned get_memsize(const char * filename){
+    FILE* file;
+    unsigned res = 0;
+    file = fopen(filename, "r");
+    fseek(file, OFFSET_MEMSIZE, SEEK_SET);
+    fread(&res, 4, 1, file);
+    fclose(file);
+    return res;
+}
+
 int visible(unsigned ip, struct Module* whitelist){
     struct Module* module_p;
     for (module_p=whitelist; module_p; module_p=module_p->next_module){
         if (module_p->base+module_p->length > ip && module_p->base <= ip)
             return 1;
     }
-
-    // Test
-    if (ip <= 0x80484e7 && ip >= 0x80482b4)
-        return 1;
-
     return 0;
 }
 
@@ -141,6 +157,7 @@ struct Handler* get_global_handler(pid_t pid, UTILITY_TYPE utility, unsigned lif
         global_handler -> prev_handler = handler_p;
     }
     handler_p -> next_handler = global_handler;
+    handler_p -> prev_handler = NULL;
     // Global handler has no ip
     handler_p -> ip = 0;
     handler_p -> utility = utility;
@@ -163,6 +180,7 @@ struct Handler* get_handler(pid_t pid, unsigned ip, UTILITY_TYPE utility, unsign
          handlers[hid]->prev_handler = handler_p;
     }
     handler_p -> next_handler = handlers[hid];
+    handler_p -> prev_handler = NULL;
     handler_p -> ip = ip;
     handler_p -> utility = utility;
     handler_p -> life = life;
@@ -248,6 +266,7 @@ enum __ptrace_request dispatch(pid_t pid, struct Handler* handler_p){
 
 void remove_from_list(struct Handler* handler, unsigned hid){
     struct Handler* removed;
+    struct Module* mod, *next_module;
     if (handler->next_handler)
         handler->next_handler->prev_handler = handler->prev_handler;
 
@@ -302,6 +321,15 @@ void new_option(){
 
 }
 
+void add_module(struct Module** whitelist, unsigned base, unsigned length){
+    struct Module* mod;
+    mod = (struct Module*)malloc(sizeof(struct Module));
+    mod -> base = base;
+    mod -> length = length;
+    mod -> next_module = *whitelist;
+    *whitelist = mod;
+}
+
 void init(){
     memset(handlers, 0, sizeof handlers);
 }
@@ -320,6 +348,7 @@ int main(){
     //unsigned buff;
     unsigned oep;
     unsigned siginfo[512];
+    unsigned baseaddr, memsize;
     enum __ptrace_request pr, pr2;
     //struct user_regs_struct regs;
     struct Handler* handler_p, *next_handler;
@@ -337,6 +366,10 @@ int main(){
     BOOL delay = FALSE;
     BOOL proceed = FALSE;
 
+    // Temporarily. Un freed !!!!!!
+    struct Module* whitelist;
+    struct Module* module_h, *next_module;
+
     init();
 
     pid_t pid = fork();
@@ -346,6 +379,9 @@ int main(){
     }else if (pid > 0){
         oep = get_entry_point(prog);
 
+        // Test
+        oep = 0x8048451;
+
         // On loaded
         wait(&wait_status);
         if (WIFSTOPPED(wait_status)){
@@ -354,6 +390,11 @@ int main(){
             opt.life = 1;
             opt.ip = oep;
             opt.file = fopen("/tmp/trace", "w");
+            // Temporarily
+            memsize = get_memsize(prog);
+            baseaddr = get_baseaddr(prog);
+            add_module(&whitelist, baseaddr, memsize);
+            opt.whitelist = whitelist;
             get_handler(pid, oep, UTILITY_TRACE, 1, &opt);
             Ptrace(PTRACE_CONT, pid, NULL, NULL);
         }
@@ -503,6 +544,12 @@ int main(){
         while (handlers[hid]){
             remove_from_list(handlers[hid], hid);
         }
+    }
+
+    // Test
+    for (module_h=whitelist;module_h;module_h=next_module){
+        next_module = module_h->next_module;
+        free(module_h);
     }
     return 0;
 }
