@@ -13,13 +13,16 @@ def parse():
     group.add_argument('-r', '--remove', action='store_const', const='remove', dest='utility')
     group.add_argument('-m', '--modify', action='store_const', const='modify', dest='utility')
     # SHOULD SUPPORT 16bit
-    parser.add_argument('-s', '--start', type=int, action='store', dest='start')
+    parser.add_argument('-s', '--start', type=int, default=0, action='store', dest='start')
     parser.add_argument('-l', '--length', type=int, action='store', default=-1, dest='length')
     parser.add_argument('-t', '--type', choices=avai, action='store', dest='type', nargs=2, default='wx')
     parser.add_argument('-i', '--input', type=argparse.FileType('r'), default=open('/dev/null'), action='store', dest='input')
 
     parser.add_argument('-o', '--output', type=argparse.FileType('w'), action='store', default=sys.stdout, dest='output')
     option = parser.parse_args()
+
+    option.raw = option.input.read().strip().split()
+    option.input.close()
 
     a = 'f' if option.type[0] in avai_f else 'u'
     b = 'f' if option.type[1] in avai_f else 'u'
@@ -38,32 +41,32 @@ def parse():
 
     return option
 
-def reformat(option):
-    option.raw = option.input.read().strip()
-    if option.u == 'c':
-        option.ripe = option.raw
-    elif option.u == 'f':
-        if option.f == 'w':
+def reformat(u, f, raw):
+    if u == 'c':
+        ripe = raw
+    elif u == 'f':
+        if f == 'w':
             pack_format = 'f'
-        elif option.f == 'g':
+        elif f == 'g':
             pack_format = 'd'
-        option.ripe = ''.join(map(lambda x:struct.pack("<"+pack_format,float(x)), option.raw.split()))
+        ripe = ''.join(map(lambda x:struct.pack("<"+pack_format,float(x)), raw))
     else:
-        pack_format = {'b':'B', 'h':'H', 'w':'I', 'g':'Q'}[option.f]
-        if option.u == 'd':
-            option.f = option.f.lower()
+        pack_format = {'b':'B', 'h':'H', 'w':'I', 'g':'Q'}[f]
+        if u == 'd':
+            f = f.lower()
         base = {'x':16,'d':1,'u':1,'o':8,'t':2}
-        option.ripe = ''.join(map(lambda x:struct.pack("<"+pack_format,int(x, base[option.u])), option.raw.split()))
+        ripe = ''.join(map(lambda x:struct.pack("<"+pack_format,int(x, base[u])), raw))
+    return ripe
 
-def modify(binary, options):
-    sorted_options = options[::-1]
+def modify(binary, ripes):
+    sorted_ripes = ripes[::-1]
     output = []
     for i, c in enumerate(binary):
         ok = False
-        for o in sorted_options:
+        for o in sorted_ripes:
             if o.utility == 'add':
                 if o.start == i:
-                    output.append(o.ripe)
+                    output.append(o)
                     output.append(c)
                     ok = True
                     break
@@ -72,8 +75,8 @@ def modify(binary, options):
                     ok = True
                     break
             elif o.utility == 'modify':
-                if o.start<=i<o.start+len(o.ripe):
-                    output.append(option.ripe[i-o.start])
+                if o.start<=i<o.start+len(o):
+                    output.append(o[i-o.start])
                     ok = True
                     break
         if not ok:
@@ -82,7 +85,7 @@ def modify(binary, options):
 
 if __name__ == '__main__':
     option = parse()
-    reformat(option)
+    reformat(option.u, option.f, option.raw)
     options = [option]
     binary = raw_input()
     res = modify(binary, options)

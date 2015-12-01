@@ -5,7 +5,9 @@ import sys
 import struct
 import argparse
 import pickle
+import copy
 import os
+import hexsed
 
 class sandbox():
 	def __init__(self, target, options):
@@ -23,7 +25,6 @@ class sandbox():
 		trace_option = filter(lambda x:x.utils=='trace', options)
 		if (trace_option):
 			self.visible_module = reduce(list.__iadd__, [x.module for x in trace_option])
-		self.trace = True
 		# Pydbg object
 		self.dbg = pydbg()
 		self.dbg.load(target)
@@ -32,27 +33,24 @@ class sandbox():
 		self.options = options
 		# The reason I use -s for MITM, is MITM will not only be used on APIs. Use it for disabling too, for convience
 		self.oep = ''
-		for opt in self.options:
-			if opt.utils in ['disable', 'mitm'] and not opt.search:
-				if opt.utils=='disable':
-					handler = self.__ban_handle
-				elif opt.utils=='mitm':
-					handler = self.__modify_param_handle
-				# Dealing handlers with the same option
-				for bp in opt.breakpoint:
-					self.handlers[bp] = copy.deepcopy(opt)
-					self.handlers[bp].breakpoint = bp
-					self.handlers[bp].name = 'Undefined'
-					if opt.type == 'hardware':
-						self.dbg.bp_set_hw(bp, 1, HW_EXECUTE, handler=handler)
-					else:
-						self.dbg.bp_set(bp, handler=handler)
+		self.dbg.set_callback(EXCEPTION_SINGLE_STEP, self.__singlestep_handle)
+		self.dbg.set_callback(CREATE_PROCESS_DEBUG_EVENT, self.__oep_handle)
 
+		# Only one option should contain oep, or only root option should contain oep, how to guarantee???????????
+		for opt in self.options:
 			if opt.oep:
 				self.oep = opt.oep
+				break
 		if not self.oep:
 			self.oep = self.pe.OPTIONAL_HEADER.ImageBase + self.pe.OPTIONAL_HEADER.AddressOfEntryPoint
-		self.dbg.bp_set(self.oep, restore=False, handler=self.__oep_handle)
+
+		print 'WTF', hex(self.pe.OPTIONAL_HEADER.ImageBase)
+		#self.dbg.bp_set(self.oep, restore=False, handler=self.__oep_handle)
+
+
+	def __loaddll_handle(self, dbg):
+		print hex(dbg.context.Eip)
+		return DBG_CONTINUE
 
 	# Run the debugger
 	def run(self):
@@ -81,11 +79,13 @@ class sandbox():
 		func_name = self.last_dyn_API
 
 		for opt in self.options:
-			if opt.utils in ['disable', 'mitm'] and opt.search and func_name in opt.breakpoint:
+			if opt.search and func_name in opt.breakpoint:
 				if opt.utils == 'disable':
 					handler = self.__ban_handle
 				elif opt.utils == 'mitm':
 					handler = self.__modify_param_handle
+				elif opt.utils == 'trace':
+					handler = self.__trace_handle
 
 				if opt.type == 'hardware':
 					dbg.bp_set_hw(func_addr, 1, HW_EXECUTE, handler=handler)
@@ -159,62 +159,97 @@ class sandbox():
 	# Works with self.handlers
 	def __modify_param_handle(self, dbg):
 		eip = dbg.context.Eip
-		esp = dbg.context.Esp
-		addr = esp + self.handlers[eip].offset
-		into = self.handlers[eip].into
-		display = self.handlers[eip].display
+		if self.handlers[eip].offset:
+			esp = dbg.context.Esp
+			addr = esp + self.handlers[eip].offset
+		elif self.handlers[eip].address:
+			addr = self.handlers[eip].address
+		# If indirect specified , lookup addres
 		if self.handlers[eip].indirect:
 			param = dbg.read(addr, 4)
 			param = struct.unpack('<I', param)[0]
 			addr = param
+
+		display = self.handlers[eip].display
 		if display == '%s':
-			length = self.handlers[eip].length
+			into = self.handlers[eip].into
+			length = len(into)
 			param = dbg.read(addr, length)
 			param = dbg.get_ascii_string(param)
 			print '[+] Param on the stack: %s' % (param[0:20]+'...' if length > 20 else param)
-			print '[+] \tChanged into %s' % into
+			print '[+] \tChanged into %s' % (into[0:20]+'...' if length > 20 else into)
 			dbg.write(addr, into, length)
 		elif display == '%d':
-			param = dbg.read(addr, 4)
-			param = struct.unpack('<I', param)[0]
-			print '[+] Param on the stack: %d' % param
-			print '[+] \tChanged into: %d' % into
-			into = struct.pack('<I', int(into))
-			dbg.write(addr, into, 4)
+			splited = self.handlers[eip].into.split()
+			n = len(splited)
+			into = hexsed.reformat('d', 'w', splited)
+			length = len(into)
+			into = ''.join(into)
+			param = dbg.read(addr, length)
+			param = ', '.join(struct.unpack('<'+'I'*n, param))
+			print '[+] Param on the stack: %s' % (param[0:20]+'...' if length > 20 else param)
+			print '[+] \tChanged into: %s' % self.handlers[eip].into
+			dbg.write(addr, into, length)
 		elif display == '%l':
-			param = dbg.read(addr, 8)
-			param = struct.unpack('<L', param)[0]
-			print '[+] Param on the stack: %l' % param
-			print '[+] \tChanged into %l' % into
-			into = struct.pack('<L', long(into))
-			dbg.write(addr, into, 8)
+			splited = self.handlers[eip].into.split()
+			n = len(splited)
+			into = hexsed.reformat('d', 'g', splited)
+			length = len(into)
+			into = ''.join(into)
+			param = dbg.read(addr, length)
+			param = ', '.join(map(str, struct.unpack('<'+'L'*n, param)))
+			print '[+] Param on the stack: %s' % (param[0:20]+'...' if length > 20 else param)
+			print '[+] \tChanged into %s' % (self.handlers[eip].into[0:20]+'...' if length>20 else self.handlers[eip].into)
+			dbg.write(addr, into, length)
 		elif display == '%x':
-			param = dbg.read(addr, 4)
-			param = struct.unpack('<I', param)[0]
-			print '[+] Param on the stack: 0x%x' % param
-			print '[+] \tChanged into: 0x%x' % into
-			into = struct.pack('<I', int(into))
-			dbg.write(addr, into, 4)
+			splited = self.handlers[eip].into.split()
+			n = len(splited)
+			into = hexsed.reformat('x', 'w', splited)
+			length = len(into)
+			into = ''.join(into)
+			param = dbg.read(addr, length)
+			param = ', 0x'.join(map(str, map(hex, struct.unpack('<'+'I'*n, param))))
+			print '[+] Param on the stack: 0x%s' % (param[0:20]+'...' if length > 20 else param)
+			print '[+] \tChanged into: %s' % (self.handlers[eip].into[0:20]+'...' if length>20 else self.handlers[eip].into)
+			dbg.write(addr, into, length)
+		elif display == '%b':
+			splited = self.handlers[eip].into.split()
+			n = len(splited)
+			into = hexsed.reformat('x', 'b', splited)
+			length = len(into)
+			into = ''.join(into)
+			param = dbg.read(addr, length)
+			param = ', '.join(map(str, map(hex, struct.unpack('<'+'B'*n, param))))
+			print '[+] Param on the stack: 0x%s' % (param[0:20]+'...' if length > 20 else param)
+			print '[+] \tChanged into: %s' % (self.handlers[eip].into[0:20]+'...' if length>20 else self.handlers[eip].into)
+			dbg.write(addr, into, length)
 		self.__handler_count_down(eip)
 		return DBG_CONTINUE
 
 	def __oep_handle(self, dbg):
+		for opt in self.options:
+			if not opt.search:
+				if opt.utils=='disable':
+					handler = self.__ban_handle
+				elif opt.utils=='mitm':
+					handler = self.__modify_param_handle
+				elif opt.utils=='trace':
+					handler = self.__trace_handle
+				# Dealing handlers with the same option
+				for bp in opt.breakpoint:
+					self.handlers[bp] = copy.deepcopy(opt)
+					self.handlers[bp].breakpoint = bp
+					self.handlers[bp].name = 'Undefined'
+					if opt.type == 'hardware':
+						self.dbg.bp_set_hw(bp, 1, HW_EXECUTE, handler=handler)
+					else:
+						self.dbg.bp_set(bp, handler=handler)
 		print '[*] Breaking on OEP: 0x%x' % dbg.context.Eip
 		# Enumerate modules loaded for now
 		# MAYBE I NEED TO WATCH LOAD_LIBRARY FUNCTION NOW!!!!!
 		for module in dbg.iterate_modules():
 			if module.szModule in self.visible_modules:
 				self.module_sections.append((module.modBaseAddr, module.modBaseAddr+module.modBaseSize))
-		# Set singlestep breakpoint for trace utility
-		if self.trace:
-			dbg.set_callback(EXCEPTION_SINGLE_STEP, self.__trace_handle)
-			for thread_id in dbg.enumerate_threads():
-				print '[+] Single step for thread %d' % thread_id
-				# What's the thread used for?
-				h_thread = dbg.open_thread(thread_id)
-				dbg.single_step(True, thread_handle=h_thread)
-				dbg.close_handle(h_thread)
-			dbg.resume_all_threads()
 
 		# TWO functions:	1. Detecting forbidden API.
 		#					2. Search for API by name
@@ -234,6 +269,17 @@ class sandbox():
 		return DBG_CONTINUE
 
 	def __trace_handle(self, dbg):
+		for thread_id in dbg.enumerate_threads():
+			print '[+] Single step for thread %d' % thread_id
+			# What's the thread used for?
+			h_thread = dbg.open_thread(thread_id)
+			dbg.single_step(True, thread_handle=h_thread)
+			dbg.close_handle(h_thread)
+		dbg.resume_all_threads()
+
+		return DBG_CONTINUE
+
+	def __singlestep_handle(self, dbg):
 		eip = dbg.context.Eip
 		self.inst_stream.append(eip)
 		# If eip is within visible modules, then break at it
@@ -251,6 +297,7 @@ class sandbox():
 				dbg.single_step(False)
 		return DBG_CONTINUE
 
+
 	def __dyn_link(self, pe, dbg):
 		for entry in pe.DIRECTORY_ENTRY_IMPORT:
 			for imp in entry.imports:
@@ -259,12 +306,14 @@ class sandbox():
 				func_addr = struct.unpack('<I', func_addr)[0]
 
 				for opt in self.options:
-					if opt.utils in ['disable', 'mitm'] and opt.search and func_name in opt.breakpoint:
+					if opt.search and func_name in opt.breakpoint:
 						print '[+] Forbidden API detected: %s\t0x%x' % (func_name, func_addr)
 						if opt.utils == 'disable':
 							handler = self.__ban_handle
 						elif opt.utils == 'mitm':
 							handler = self.__modify_param_handle
+						elif opt.utils == 'trace':
+							handler = self.__trace_handle
 
 						if opt.type == 'hardware':
 							dbg.bp_set_hw(func_addr, 1, HW_EXECUTE, handler=handler)
@@ -276,28 +325,31 @@ class sandbox():
 
 def parse_options(args):
 	parser = argparse.ArgumentParser()
+	# Primary general option
 	parser.add_argument('--oep', action='store', dest='oep', help='Specify OEP.')
+	parser.add_argument('-b', action='store', dest='breakpoint', required=True, help='Breakpoint. API name/Address/"oep", depending on -s', nargs='+')
+	parser.add_argument('--no-search', action='store_false', dest='search', default=True, help='Don\'t search for the name, given by -b. Search by default')
+	parser.add_argument('-t', action='store', choices=['hardware', 'memory'], dest='type', default='memory', help='Type of breakpoint. Memory by default')
+	parser.add_argument('--time', action='store', type=int, dest='time', default='-1', help='Time to live for the handler')
 	subparses = parser.add_subparsers(title='Utils', dest='utils', help='USE %(prog)s disable -h OR %(prog)s mitm -h FOR DETAILS')
+	# Options for disable module
 	parser_disable = subparses.add_parser('disable', help='Disable specified APIs.')
 	parser_disable.add_argument('-i', '--interactive', action='store_true', dest='interactive', default=False, help='Prompt before disabling')
-	parser_disable.add_argument('-b', action='store', dest='breakpoint', required=True, help='Breakpoint. Name or address, depending on -s', nargs='+')
-	parser_disable.add_argument('-t', action='store', choices=['hardware', 'memory'], dest='type', default='memory', help='Type of breakpoint. Memory by default')
-	parser_disable.add_argument('--no-search', action='store_false', dest='search', default=True, help='Don\'t search for the name, given by -b. Search by default')
-	parser_disable.add_argument('--time', action='store', type=int, dest='time', default='-1', help='Time to live for the handler')
+	# Options for mitm module
 	parser_mitm = subparses.add_parser('mitm', help='Man in the Middle')
 	parser_mitm.add_argument('--indirect', action='store_true', dest='indirect', default=False, help='Indirect Address. False by default')
-	parser_mitm.add_argument('--offset', action='store', type=int, dest='offset', required=True, help='Bytes offset to the param from esp')
+	group = parser_mitm.add_mutually_exclusive_group(required=True)
+	group.add_argument('--offset', action='store', dest='offset', help='Bytes offset to the param from esp')
+	group.add_argument('--address', action='store', dest='address', help='Absolute address to modify data')
 	parser_mitm.add_argument('--length', action='store', type=int, dest='length', help='The length of the continuous memory')
-	parser_mitm.add_argument('--into', dest='into', required=True, help='Change bytes into')
-	parser_mitm.add_argument('--display', action='store', choices=['%s', '%d', '%l', '%x'],
+	parser_mitm.add_argument('--into', type=argparse.FileType('r'), default=sys.stdin, dest='into', help='Change bytes into')
+	parser_mitm.add_argument('--display', action='store', choices=['%s', '%d', '%l', '%x', '%b'],
 								default='%s', dest='display', help='Format of displaying')
-	parser_mitm.add_argument('-b', action='store', dest='breakpoint', required=True, help='Breakpoint. Name or address, depending on -s', nargs='+')
-	parser_mitm.add_argument('-t', action='store', choices=['hardware', 'memory'], dest='type', default='memory', help='Type of breakpoint. Memory by default')
-	parser_mitm.add_argument('--no-search', action='store_false', dest='search', default=True, help='Don\'t search for the name, given by -b. Search by default')
-	parser_mitm.add_argument('--time', action='store', type=int, dest='time', default='-1', help='Time to live for the handler')
+	# Options for trace module
 	parser_trace = subparses.add_parser('trace', help='Trace the execution of instructions.')
-	parser_trace.add_argument('-f', action='store', dest='file', help='Output File')
+	parser_trace.add_argument('-f', type=argparse.FileType('w'), required=True, action='store', dest='file', help='Output File')
 	parser_trace.add_argument('-m', action='append', dest='module', help='Visible Modules')
+	#
 	parser.add_argument('-l', action='store', dest='log', help='Log filename. Not supported yet.')
 	parser.add_argument('-c', action='store', dest='crash-report', help='Crash report filename. Not supported yet.')
 
@@ -305,33 +357,35 @@ def parse_options(args):
 
 	# MITM argument check
 	if option.utils == 'mitm':
+		if option.offset:
+			if option.offset.startswith('0x'):
+				option.offset = int(option.offset[2:], 16)
+			else:
+				option.offset = int(option.offset, 16)
+			option.r
+		elif option.address:
+			if option.address.startswith('0x'):
+				option.address = int(option.address[2:], 16)
+			else:
+				option.address = int(option.address, 16)
+		else:
+			raise
+		raw = option.into.read().strip()
+		option.into.close()
+		option.into = raw
 		if  option.display == '%s' and len(option.into)!=option.length:
 			sys.stderr.write('[-] Length is incompatible with into')
 			exit(0)
-		try:
-			if option.display == '%d':
-				option.into = int(option.into)
-			elif option.display == '%l':
-				option.into = long(option.into)
-			elif option.display == '%x':
-				option.into = int(option.into[2:], 16)
-		except:
-			sys.stderr.write('[-] Wrong input format')
-			exit(0)
 
 	# Translate breakpoint into integer
-	if option.utils in ['mitm', 'disable'] and not option.search:
+	if not option.search:
 		for i, bp in enumerate(option.breakpoint):
-			if bp.startswith('0x'):
+			if bp == 'oep':
+				option.search = True
+			elif bp.startswith('0x'):
 				option.breakpoint[i] = int(bp[2:], 16)
 			else:
 				option.breakpoint[i] = int(bp)
-	if option.utils == 'trace':
-		if option.oep:
-			if option.oep.startswith('0x'):
-				option.oep = int(option.oep[2:], 16)
-			else:
-				option.eop = int(option.oep)
 	return option
 
 if __name__ == '__main__':
@@ -340,7 +394,8 @@ if __name__ == '__main__':
 	a = sandbox(sys.argv[1], [options])
 	a.run()
 
+	# IT'S NOT GOOD TO LEAVE IT HERE
 	if options.file:
-		with open(options.file, 'w+') as f:
-			pickle.dump(a.inst_stream, f)
+		pickle.dump(a.inst_stream, options.file)
+		options.file.close()
 	print '[*] Exit'

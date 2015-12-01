@@ -1,6 +1,8 @@
 Priority:
     Cross-Platform
     Program like reversing.kr/ImagePrc failed to track the main part. Unless oep specified. Why?
+    Failed setting breakpoint at 00401CD0 in reversing/7
+    Trace need breakpoint, not oep
 Sandbox
     Breakpoint for new thread
     Logging system
