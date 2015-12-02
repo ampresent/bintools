@@ -82,7 +82,8 @@ trace = []
 for parent, dirnames, filenames in os.walk('c:\\trace'):
     for fname in filenames:
         with open(os.path.join(parent, fname)) as f:
-            trace.append(pickle.load(f))
+            #trace.append(pickle.load(f))
+			trace.append(map(eval,f.read().split()))
 
 prb = probability(trace)
 etr = entropy(prb)

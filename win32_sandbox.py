@@ -4,7 +4,6 @@ import pefile
 import sys
 import struct
 import argparse
-import pickle
 import copy
 import os
 import hexsed
@@ -29,24 +28,13 @@ class sandbox():
 		self.dbg = pydbg()
 		self.dbg.load(target)
 		self.pe = pefile.PE(target)
+		self.oep_rva = self.pe.OPTIONAL_HEADER.AddressOfEntryPoint
+		self.oep = ''
 		# Raw option
 		self.options = options
 		# The reason I use -s for MITM, is MITM will not only be used on APIs. Use it for disabling too, for convience
-		self.oep = ''
 		self.dbg.set_callback(EXCEPTION_SINGLE_STEP, self.__singlestep_handle)
-		self.dbg.set_callback(CREATE_PROCESS_DEBUG_EVENT, self.__oep_handle)
-
-		# Only one option should contain oep, or only root option should contain oep, how to guarantee???????????
-		for opt in self.options:
-			if opt.oep:
-				self.oep = opt.oep
-				break
-		if not self.oep:
-			self.oep = self.pe.OPTIONAL_HEADER.ImageBase + self.pe.OPTIONAL_HEADER.AddressOfEntryPoint
-
-		print 'WTF', hex(self.pe.OPTIONAL_HEADER.ImageBase)
-		#self.dbg.bp_set(self.oep, restore=False, handler=self.__oep_handle)
-
+		self.dbg.set_callback(CREATE_PROCESS_DEBUG_EVENT, self.__create_process_handle)
 
 	def __loaddll_handle(self, dbg):
 		print hex(dbg.context.Eip)
@@ -226,6 +214,19 @@ class sandbox():
 		self.__handler_count_down(eip)
 		return DBG_CONTINUE
 
+	def __create_process_handle(self, dbg):
+		self.base_of_image = dbg.dbg.u.CreateProcessInfo.lpBaseOfImage
+		# Only one option should contain oep, or only root option should contain oep, how to guarantee???????????
+		for opt in self.options:
+			if opt.oep:
+				self.oep = opt.oep
+				break
+		if not self.oep:
+			self.oep = self.oep_rva + self.base_of_image
+
+		self.dbg.bp_set(self.oep, restore=False, handler=self.__oep_handle)
+		return DBG_CONTINUE
+
 	def __oep_handle(self, dbg):
 		for opt in self.options:
 			if not opt.search:
@@ -243,7 +244,8 @@ class sandbox():
 					if opt.type == 'hardware':
 						self.dbg.bp_set_hw(bp, 1, HW_EXECUTE, handler=handler)
 					else:
-						self.dbg.bp_set(bp, handler=handler)
+						pass
+						#self.dbg.bp_set(bp, handler=handler)
 		print '[*] Breaking on OEP: 0x%x' % dbg.context.Eip
 		# Enumerate modules loaded for now
 		# MAYBE I NEED TO WATCH LOAD_LIBRARY FUNCTION NOW!!!!!
@@ -299,12 +301,20 @@ class sandbox():
 
 
 	def __dyn_link(self, pe, dbg):
+		modules = dict(map(lambda (name,addr): (name.lower(),addr),dbg.enumerate_modules()))
 		for entry in pe.DIRECTORY_ENTRY_IMPORT:
+			try:
+				module_base = modules[entry.dll.lower()]
+			except:
+				continue
 			for imp in entry.imports:
 				func_name = imp.name
-				func_addr = dbg.read(imp.address, 4)
-				func_addr = struct.unpack('<I', func_addr)[0]
-
+				if not func_name:
+					continue
+				# DOES LOWER UPPER MATTER?????????
+				func_addr = dbg.func_resolve(entry.dll, func_name)
+				#func_addr = imp.thunk_rva + module_base
+ 
 				for opt in self.options:
 					if opt.search and func_name in opt.breakpoint:
 						print '[+] Forbidden API detected: %s\t0x%x' % (func_name, func_addr)
@@ -315,13 +325,16 @@ class sandbox():
 						elif opt.utils == 'trace':
 							handler = self.__trace_handle
 
-						if opt.type == 'hardware':
-							dbg.bp_set_hw(func_addr, 1, HW_EXECUTE, handler=handler)
-						else:
-							dbg.bp_set(func_addr, handler=handler)
-						self.handlers[func_addr] = copy.deepcopy(opt)
-						self.handlers[func_addr].breakpoint = func_addr
-						self.handlers[func_addr].name = func_name
+						try:
+							if opt.type == 'hardware':
+								dbg.bp_set_hw(func_addr, 1, HW_EXECUTE, handler=handler)
+							else:
+								dbg.bp_set(func_addr, handler=handler)
+							self.handlers[func_addr] = copy.deepcopy(opt)
+							self.handlers[func_addr].breakpoint = func_addr
+							self.handlers[func_addr].name = func_name
+						except:
+							print '[-] Failed to place breakpoint %s\t0x%x' % (func_name, func_addr)
 
 def parse_options(args):
 	parser = argparse.ArgumentParser()
@@ -395,7 +408,7 @@ if __name__ == '__main__':
 	a.run()
 
 	# IT'S NOT GOOD TO LEAVE IT HERE
-	if options.file:
-		pickle.dump(a.inst_stream, options.file)
+	if options.utils == 'trace' and options.file:
+		options.file.write('\n'.join(a.inst_stream))
 		options.file.close()
 	print '[*] Exit'
