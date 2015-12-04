@@ -59,30 +59,45 @@ struct Module{
     struct Module* next_module;
 };
 
-struct Option{
-    UTILITY_TYPE utility;
-    unsigned ip;
-    unsigned life;
+struct TraceOption{
     FILE* file;
     struct Module* whitelist;
 };
 
-struct Handler{
+struct DisableOption{
+
+};
+
+struct MITMOption{
+
+};
+
+struct Option{
     UTILITY_TYPE utility;
-    unsigned ip;
-    BOOL global_flag;
-    // The readonly part of Handler
-    struct Option* option;           // Options
-    // A duplicate of Option.life
-    unsigned life;                   // The life of the handler
+    unsigned life;
+    struct Option* next_option;
+    union{
+        struct TraceOption trace_option;
+        struct DisableOption disable_option;
+        struct MITMOption mitm_option;
+    };
+};
+
+struct Handler{
+    unsigned ip;                     // Address asscociated with the Handler. If global_flag specified, ip = 0
     unsigned backup;                 // Backup of the memory on the breakpoint
+    unsigned life;                   // The life of the handler, duplication of option.life. But writable
+    BOOL global_flag;                // Which queue it should be append to. Whether should clean breakpoint
+    struct Option* option;           // Options, readonly, and consistent
     struct Handler* next_handler;    // Pointer to next handler on the list
     struct Handler* prev_handler;    // Pointer to next handler on the list
 };
 
 // It's a stack. FILO
-struct Handler *handlers[MAX_HASH];
-struct Handler *global_handler;
+struct Handler *handlers[MAX_HASH], *global_handler;
+struct Handler* handler_p, *next_handler;
+struct Module* whitelist, *module_h, *next_module;
+struct Option* options, *option_h, *next_option;
 
 long Ptrace(enum __ptrace_request request, pid_t pid, void *addr,void *data){
     long result;
@@ -107,6 +122,14 @@ int get_single_instruction_word(unsigned word, char* str, size_t bufsize){
     char bytes[4];
     sprintf(bytes, "%c%c%c%c", word&0xff, (word>>8)&0xff, (word>>16)&0xff, (word>>24)&0xff);
     return get_single_instruction(bytes, str, bufsize);
+}
+
+int get_single_instruction_at(pid_t pid, unsigned ip, char* str, size_t bufsize){
+    unsigned data;
+    int len;
+    data = Ptrace(PTRACE_PEEKTEXT, pid, (void*)ip, NULL);
+    len = get_single_instruction_word(data, str, bufsize);
+    return len;
 }
 
 unsigned get_entry_point(const char * filename){
@@ -148,72 +171,111 @@ int visible(unsigned ip, struct Module* whitelist){
     return 0;
 }
 
-struct Handler* get_global_handler(pid_t pid, UTILITY_TYPE utility, unsigned life, struct Option* opt){
+struct Option* get_option(UTILITY_TYPE utility, unsigned life){
+    struct Option* no;
+    no = (struct Option*)malloc(sizeof(struct Option));
+    no -> utility = utility;
+    no -> life = life;
+    no -> next_option = options;
+    options = no;
+    return no;
+}
+
+struct Option* get_trace_option(FILE* file, struct Module* whitelist){
+    struct Option* no;
+    no = get_option(UTILITY_TRACE, 1);
+    no -> trace_option.file = file;
+    no -> trace_option.whitelist = whitelist;
+    return no;
+}
+
+struct Handler* get_global_handler(pid_t pid, unsigned ip, struct Option* opt){
     struct Handler *handler_p;
+    unsigned backup;
+    unsigned hid;
+
+    hid = GETID(ip);
     handler_p = (struct Handler*)malloc(sizeof(struct Handler));
     handler_p -> global_flag = TRUE;
     handler_p -> option = opt;
-    if (global_handler){
-        global_handler -> prev_handler = handler_p;
-    }
+
+    // If already a breakpoint exists at this instruction
+    // Then just copy the backup
+    if (handlers[hid])
+        backup = handlers[hid] -> backup;
+    else
+        backup = Ptrace(PTRACE_PEEKTEXT, pid, (void*)ip, NULL);
+
+    // Not a breakpoint, just additional information
+    handler_p -> ip = ip;
+    handler_p -> backup = backup;
+    handler_p -> life = opt -> life;
+
+    if (global_handler) global_handler -> prev_handler = handler_p;
     handler_p -> next_handler = global_handler;
     handler_p -> prev_handler = NULL;
-    // Global handler has no ip
-    handler_p -> ip = 0;
-    handler_p -> utility = utility;
-    handler_p -> life = life;
     global_handler = handler_p;
-    // So global handler doesn't necessarily work with breakpoints
-    // At least doesn't work with breakpoints positively
     return handler_p;
 }
 // Allocate a new handler
-struct Handler* get_handler(pid_t pid, unsigned ip, UTILITY_TYPE utility, unsigned life, struct Option* opt){
+struct Handler* get_handler(pid_t pid, unsigned ip, struct Option* opt){
     HANDLER_ID hid;
-    unsigned backup, buff;
-    hid = GETID(ip);
     struct Handler *handler_p;
+    unsigned buff, backup;
+
+    hid = GETID(ip);
     handler_p = (struct Handler*)malloc(sizeof(struct Handler));
     handler_p -> global_flag = FALSE;
     handler_p -> option = opt;
+
+    // If already exists a breakpoint at this instruction
     if (handlers[hid]){
-         handlers[hid]->prev_handler = handler_p;
+        backup = handlers[hid] -> backup;
+    }else{
+    // Else, place a new breakpoint
+        // Read the address of bp, making backup
+        backup = Ptrace(PTRACE_PEEKTEXT, pid, (void*)ip, NULL);
+        buff = (backup&0xffffff00) | 0xcc;
+        Ptrace(PTRACE_POKETEXT, pid, (void*)ip, (void*)buff);
     }
+
+    // IP is not breakpoint, just additional information
+    handler_p -> ip = ip;
+    handler_p -> backup = backup;
+    handler_p -> life = opt->life;
+
+    if (handlers[hid]) handlers[hid]->prev_handler = handler_p;
     handler_p -> next_handler = handlers[hid];
     handler_p -> prev_handler = NULL;
-    handler_p -> ip = ip;
-    handler_p -> utility = utility;
-    handler_p -> life = life;
     handlers[hid] = handler_p;
-
-    backup = Ptrace(PTRACE_PEEKDATA, pid, (void*)ip, NULL);
-    handler_p -> backup = backup;
-    buff = (backup&0xffffff00) | 0xcc;
-    Ptrace(PTRACE_POKETEXT, pid, (void*)ip, (void*)buff);
 
     return handler_p;
 }
 
 enum __ptrace_request trace(pid_t pid, struct Handler* handler){
-    //int wait_status;
     unsigned ip, esp, ret;
     struct user_regs_struct regs;
+    char inst_str[128];
+    int len;
     Ptrace(PTRACE_GETREGS, pid, NULL, &regs);
     ip = regs.eip;
-    // if ip is within a visible module
-    if (visible(ip, handler->option->whitelist)){
-        fprintf(handler->option->file, "0x%x\n", ip);
-        fflush(handler->option->file);
-        get_global_handler(pid, handler->utility, 1, handler->option);
+    // if ip is within a visible module. Output and trace on
+    if (visible(ip, handler->option->trace_option.whitelist)){
+        fprintf(handler->option->trace_option.file, "0x%x\n", ip);
+        fflush(handler->option->trace_option.file);
+
+        len = get_single_instruction_at(pid, ip, inst_str, 128);
+        if (!strncmp(inst_str, "call", 4)){
+            // If 'call', record the latest 'ret' addr
+            get_global_handler(pid, ip + len, handler->option);
+        }else{
+            // If not 'call', hand on the latest 'ret' addr
+            get_global_handler(pid, handler->ip, handler->option);
+        }
         return PTRACE_SINGLESTEP;
     }else{
-        esp = regs.esp;
-        ret = Ptrace(PTRACE_PEEKDATA, pid, (void*)esp, NULL);
-        if (visible(ret, handler->option->whitelist)){
-            //backup = Ptrace(PTRACE_PEEKDATA, pid, (void*)ret, NULL);
-            //buff = (backup&0xffffff00) | 0xcc;
-            get_handler(pid, ret, handler->utility, 1, handler->option);
-        }
+    // If not, run until the latest 'ret' addr
+        get_handler(pid, handler->ip, handler->option);
         return PTRACE_CONT;
     }
 }
@@ -228,13 +290,12 @@ void bp_hide(pid_t pid, struct Handler* handler_p){
     unsigned data;
     data = Ptrace(PTRACE_PEEKTEXT, pid, (void*)ip, NULL);
     get_single_instruction_word(data, inst_str, 128);
-    printf("%s\n", inst_str);
 }
 
 // ????????????????????STRANGE
 void bp_show(pid_t pid, struct Handler* handler_p){
     unsigned backup, ip, buff;
-    ip = handler_p -> option->ip;
+    ip = handler_p -> ip;
     backup = Ptrace(PTRACE_PEEKDATA, pid, (void*)ip, NULL);
     buff = (backup&0xffffff00)|0xcc;
     Ptrace(PTRACE_POKETEXT, pid, (void*)ip, (void*)buff);
@@ -247,7 +308,7 @@ enum __ptrace_request dispatch(pid_t pid, struct Handler* handler_p){
         bp_hide(pid, handler_p);
     }
     pr = PTRACE_CONT;
-    switch (handler_p -> utility){
+    switch (handler_p -> option -> utility){
         case UTILITY_DISABLE:
             pr = PTRACE_CONT;
             break;
@@ -264,37 +325,47 @@ enum __ptrace_request dispatch(pid_t pid, struct Handler* handler_p){
     return pr;
 }
 
+void remove_from_global_list(struct Handler* handler){
+    struct Handler* removed;
+    struct Module* mod, *next_module;
+    if (handler->next_handler)
+        handler->next_handler->prev_handler = handler->prev_handler;
+    if (handler->prev_handler)
+        handler->prev_handler->next_handler = handler->next_handler;
+    // If we're removing head, then proceed the head
+    if (global_handler==handler)
+        global_handler = handler->next_handler;
+    free(handler);
+}
+
 void remove_from_list(struct Handler* handler, unsigned hid){
     struct Handler* removed;
     struct Module* mod, *next_module;
     if (handler->next_handler)
         handler->next_handler->prev_handler = handler->prev_handler;
-
-    if (handler->prev_handler){
+    if (handler->prev_handler)
         handler->prev_handler->next_handler = handler->next_handler;
-    }
-
-    if (global_handler==handler){
-        global_handler = handler->next_handler;
-    }
-    else if(handler==handlers[hid]){
+    // If we're removing head, then proceed the head
+    if(handler==handlers[hid])
         handlers[hid] = handler->next_handler;
-    }
     free(handler);
 }
 
+// Next_handler argument to keep track of the iteration
 enum __ptrace_request global_expire(pid_t pid, struct Handler* handler, struct Handler** next_handler){
     struct Handler* prev;
     if (handler->life > 0){
         handler->life --;
-        if (handler->life == 0){
-            *next_handler = handler->next_handler;
-            remove_from_list(handler, 0);
-        }
+    }
+    if (handler->life <= 0){
+        *next_handler = handler->next_handler;
+        remove_from_global_list(handler);
     }
     // The lowest priority
     return PTRACE_CONT;
 }
+
+// Next_handler argument to keep track of the iteration
 enum __ptrace_request expire(pid_t pid, struct Handler* handler, unsigned hid, struct Handler** next_handler){
     struct Handler* prev;
     //unsigned backup, breakpoint;
@@ -302,23 +373,20 @@ enum __ptrace_request expire(pid_t pid, struct Handler* handler, unsigned hid, s
         // Has been used once before call to expire
         // So decrease it by 1
         handler->life --;
-        if (handler->life > 0){
-            get_global_handler(pid, GLOBAL_REPAIR, 1, handler->option);
-            return PTRACE_SINGLESTEP;
-        }else{
-            // Leave it stuffed!(By dispatch, so expire save the effort)
-            // Ptrace(PTRACE_POKETEXT, pid, (void*)breakpoint, (void*)backup);
-            // Remove the handler from the list
-            *next_handler = handler->next_handler;
-            remove_from_list(handler, hid);
-            // The lowest priority
-            return PTRACE_CONT;
-        }
+    }
+    if (handler->life > 0){
+        get_global_handler(pid, handler->ip, get_option(GLOBAL_REPAIR, 1));
+        return PTRACE_SINGLESTEP;
+    }else{
+        // Leave it stuffed!(By dispatch, so expire save the effort)
+        // Ptrace(PTRACE_POKETEXT, pid, (void*)breakpoint, (void*)backup);
+        // Remove the handler from the list
+        *next_handler = handler->next_handler;
+        remove_from_list(handler, hid);
+        // The lowest priority
+        return PTRACE_CONT;
     }
     return PTRACE_CONT;
-}
-void new_option(){
-
 }
 
 void add_module(struct Module** whitelist, unsigned base, unsigned length){
@@ -334,9 +402,24 @@ void init(){
     memset(handlers, 0, sizeof handlers);
 }
 
+void finalize(){
+    unsigned hid;
+    for (hid=0;hid<=MAX_HASH;hid++)
+        while (handlers[hid])
+            remove_from_list(handlers[hid], hid);
+    while (global_handler)
+        remove_from_global_list(global_handler);
+    for (module_h=whitelist;module_h;module_h=next_module){
+        next_module = module_h->next_module;
+        free(module_h);
+    }
+    for (option_h=options;option_h;option_h=next_option){
+        next_option = option_h->next_option;
+        free(option_h);
+    }
+}
 int main(){
     //unsigned i;
-    int wait_status;
     //int len;
     //int offset;
     //unsigned ban;
@@ -344,31 +427,24 @@ int main(){
     //unsigned backup;
     //unsigned addr;
     //unsigned data;
-    unsigned hid;
     //unsigned buff;
+    unsigned hid;
     unsigned oep;
+    // This is NOT THE PROPER WAY!!!
     unsigned siginfo[512];
     unsigned baseaddr, memsize;
     enum __ptrace_request pr, pr2;
     //struct user_regs_struct regs;
-    struct Handler* handler_p, *next_handler;
     //char inst_str[128];
     // Test
-    struct Option opt;
-
+    const char *prog = "./try";
     //char indirect = 0;
     //char manual = 0;
     //char plt = 1;
     //int pop = 0;
     //ban = 0x0804841b;
-    const char *prog = "./try";
+    int wait_status;
     struct user_regs_struct regs;
-    BOOL delay = FALSE;
-    BOOL proceed = FALSE;
-
-    // Temporarily. Un freed !!!!!!
-    struct Module* whitelist;
-    struct Module* module_h, *next_module;
 
     init();
 
@@ -378,24 +454,16 @@ int main(){
         execl(prog, prog, NULL);
     }else if (pid > 0){
         oep = get_entry_point(prog);
-
         // Test
-        oep = 0x8048451;
-
+        oep = 0x080484a1;
         // On loaded
         wait(&wait_status);
         if (WIFSTOPPED(wait_status)){
-            // Test
-            opt.utility = UTILITY_TRACE;
-            opt.life = 1;
-            opt.ip = oep;
-            opt.file = fopen("/tmp/trace", "w");
-            // Temporarily
+            // Test, wrong
             memsize = get_memsize(prog);
             baseaddr = get_baseaddr(prog);
             add_module(&whitelist, baseaddr, memsize);
-            opt.whitelist = whitelist;
-            get_handler(pid, oep, UTILITY_TRACE, 1, &opt);
+            get_handler(pid, oep, get_trace_option(fopen("/tmp/trace","w"), whitelist));
             Ptrace(PTRACE_CONT, pid, NULL, NULL);
         }
 
@@ -539,17 +607,6 @@ int main(){
         perror("Folk failed: ");
         exit(-1);
     }
-
-    for (hid=0;hid<=MAX_HASH;hid++){
-        while (handlers[hid]){
-            remove_from_list(handlers[hid], hid);
-        }
-    }
-
-    // Test
-    for (module_h=whitelist;module_h;module_h=next_module){
-        next_module = module_h->next_module;
-        free(module_h);
-    }
+    finalize();
     return 0;
 }
