@@ -6,48 +6,34 @@ import struct
 import argparse
 import copy
 import os
+import json
 import hexsed
+import itertools
+import operator
 
 class sandbox():
-	def __init__(self, target, options):
-	# Only for use of disable API, to speed up
-		# For general use, containing time to live etc.
-		self.handlers = dict()
-		# Instruction stream
-		self.inst_stream = []
-		# Modules chosen to be visible when tracing
-		# Maybe useless when coloring IDA pro
-		self.visible_modules = []
-		self.visible_modules.append(os.path.basename(target))
-		self.module_sections = []
-		# If any trace specified
-		trace_option = filter(lambda x:x.utils=='trace', options)
-		if (trace_option):
-			self.visible_module = reduce(list.__iadd__, [x.module for x in trace_option])
-		# Pydbg object
+	def __init__(self):
+		self.breakpoints = []
+		self.handlers = []
+		self.global_handlers = []
 		self.dbg = pydbg()
-		self.dbg.load(target)
-		self.pe = pefile.PE(target)
-		self.oep_rva = self.pe.OPTIONAL_HEADER.AddressOfEntryPoint
-		self.oep = ''
-		# Raw option
-		self.options = options
-		# The reason I use -s for MITM, is MITM will not only be used on APIs. Use it for disabling too, for convience
-		self.dbg.set_callback(EXCEPTION_SINGLE_STEP, self.__singlestep_handle)
 		self.dbg.set_callback(CREATE_PROCESS_DEBUG_EVENT, self.__create_process_handle)
-
-	def __loaddll_handle(self, dbg):
-		print hex(dbg.context.Eip)
-		return DBG_CONTINUE
+		self.dbg.set_callback(EXCEPTION_SINGLE_STEP, self.__universal_handle)
+		self.plugins = {
+			'disable': {'handler': self.__disable_handle},
+			'trace': {'pre_process': self.__trace_pre_process, 'handler': self.__trace_start_handle, 'post_process': self.__trace_post_process},
+			'mitm':{'handler': self.__mitm_handle},
+			'intercept':{'handler':self.__intercept_handler}
+		}
 
 	# Run the debugger
 	def run(self):
 		self.dbg.run()
 
 	# Works with self.handlers
-	def __ban_handle(self, dbg):
+	def __disable_handle(self, dbg, handler):
 		func_addr = dbg.context.Eip
-		func_name = self.handlers[func_addr].name
+		func_name = self.breakpoints[handler['bp']]['name']
 		print '[+] Banning API: %s\t0x%x' % (func_name, func_addr)
 		det = 1
 		# There should be range detection???
@@ -59,39 +45,32 @@ class sandbox():
 				break
 			det += 1
 
-		self.__handler_count_down(func_addr)
 		return DBG_CONTINUE
 
 	def __gpa_ret_handle(self, dbg):
 		func_addr = dbg.context.Eax
 		func_name = self.last_dyn_API
 
-		for opt in self.options:
-			if opt.search and func_name in opt.breakpoint:
-				if opt.utils == 'disable':
-					handler = self.__ban_handle
-				elif opt.utils == 'mitm':
-					handler = self.__modify_param_handle
-				elif opt.utils == 'trace':
-					handler = self.__trace_handle
-
-				if opt.type == 'hardware':
-					dbg.bp_set_hw(func_addr, 1, HW_EXECUTE, handler=handler)
-				else:
-					dbg.bp_set(func_addr, handler=handler)
-				self.handlers[func_addr] = copy.deepcopy(opt)
-				self.handlers[func_addr].breakpoint = func_addr
-				self.handlers[func_addr].name = func_name
+		for i, bp in enumerate(self.breakpoints):
+			if bp['search'] and not bp['resolved']:
+				module, func = bp['addr'].split('@')
+				# I SHOULD DEAL WITH module!!!!!!!
+				module = module.lower()
+				if func == func_name:
+					bp['addr'] = func_addr
+					bp['name'] = func_name
+					print '[+] Place breakpoint on %s:0x%x' % (func_name,func_addr)
+					if bp['type'] == 'hardware':
+						dbg.bp_set_hw(func_addr, 1, HW_EXECUTE, handler=self.__universal_handle)
+					else:
+						dbg.bp_set(func_addr, handler=self.__universal_handle)
 
 		return DBG_CONTINUE
 
 	# Not of much use, only to retrieve func_name, and set breakpoint on retn
 	def __gpa_handle(self, dbg):
-		#print '[*] Breaking on GetProcAddress: 0x%x' % dbg.context.Eip
-		# 32 elf system only
 		esp = dbg.context.Esp
 		ret = struct.unpack('<I', dbg.read(esp, 4))[0]
-
 		func_name_ptr = struct.unpack('<I', dbg.read(esp+8, 4))[0]
 		try:
 			# Should check the range
@@ -102,9 +81,7 @@ class sandbox():
 			return DBG_CONTINUE
 		func_name = dbg.get_ascii_string(func_name)
 		# Func_addr unknown yet until GetProcAddress returns
-
 		#print '[+] Forbidden API detected: %s' % func_name
-
 		# Execute Until Return
 		dbg.bp_set(ret, restore=False, handler=self.__gpa_ret_handle)
 		self.last_dyn_API = func_name
@@ -134,18 +111,18 @@ class sandbox():
 	'''
 
 	# Works with self.handlers
-	def __handler_count_down(self, eip):
-		if self.handlers[eip].time > -1:
-			self.handlers[eip].time -= 1
-		print '[*] Handler %s\t0x%x expired' % (self.handlers[eip].name, eip)
-		if self.handlers[eip].time == 0:
-			if self.handlers[eip].type == 'hardware':
-				self.dbg.bp_del_hw(eip)
-			else:
-				self.dbg.bp_del(eip)
+	def __handler_count_down(self, bp):
+		if bp['time'] > 0:
+			bp['time'] -= 1
+			if bp['time'] == 0:
+				print '[*] Handler expired at: %s\t0x%x' % (bp['name'], bp['addr'])
+				if bp['time'] == 'hardware':
+					self.dbg.bp_del_hw(bp['addr'])
+				else:
+					self.dbg.bp_del(bp['addr'])
 
 	# Works with self.handlers
-	def __modify_param_handle(self, dbg):
+	def __mitm_handle(self, dbg):
 		eip = dbg.context.Eip
 		if self.handlers[eip].offset:
 			esp = dbg.context.Esp
@@ -217,75 +194,83 @@ class sandbox():
 	def __create_process_handle(self, dbg):
 		self.base_of_image = dbg.dbg.u.CreateProcessInfo.lpBaseOfImage
 		# Only one option should contain oep, or only root option should contain oep, how to guarantee???????????
-		for opt in self.options:
-			if opt.oep:
-				self.oep = opt.oep
-				break
-		if not self.oep:
-			self.oep = self.oep_rva + self.base_of_image
+		if not self.options['oep']:
+			self.options['oep'] = self.oep_rva + self.base_of_image
+		else:
+			self.options['oep'] = self.options['oep']-self.fake_base_of_image+self.base_of_image
+		dbg.bp_set(self.options['oep'], restore=False, handler=self.__oep_handle)
 
-		self.dbg.bp_set(self.oep, restore=False, handler=self.__oep_handle)
+		for hs in self.handlers.itervalues():
+			for h in hs:
+				if 'pre_process' in self.plugins[h['util']]:
+					self.plugins[h['util']]['pre_process'](h)
 		return DBG_CONTINUE
 
 	def __oep_handle(self, dbg):
-		for opt in self.options:
-			if not opt.search:
-				if opt.utils=='disable':
-					handler = self.__ban_handle
-				elif opt.utils=='mitm':
-					handler = self.__modify_param_handle
-				elif opt.utils=='trace':
-					handler = self.__trace_handle
-				# Dealing handlers with the same option
-				for bp in opt.breakpoint:
-					self.handlers[bp] = copy.deepcopy(opt)
-					self.handlers[bp].breakpoint = bp
-					self.handlers[bp].name = 'Undefined'
-					if opt.type == 'hardware':
-						self.dbg.bp_set_hw(bp, 1, HW_EXECUTE, handler=handler)
-					else:
-						pass
-						#self.dbg.bp_set(bp, handler=handler)
 		print '[*] Breaking on OEP: 0x%x' % dbg.context.Eip
 		# Enumerate modules loaded for now
-		# MAYBE I NEED TO WATCH LOAD_LIBRARY FUNCTION NOW!!!!!
-		for module in dbg.iterate_modules():
-			if module.szModule in self.visible_modules:
-				self.module_sections.append((module.modBaseAddr, module.modBaseAddr+module.modBaseSize))
-
-		# TWO functions:	1. Detecting forbidden API.
-		#					2. Search for API by name
-		# POSSIBLY LOAD_TIME LINKING SHOULD NOT BE PUT IN THE OEP HANDLE
 		# Load-time Dynamic Linking
-		self.__dyn_link(self.pe, self.dbg)
+		self.__dyn_link()
 		# Run-time Dynamic Linking
-		getprocaddr = self.dbg.func_resolve('kernel32.dll', 'GetProcAddress')
-		dbg.bp_set(getprocaddr, handler=self.__gpa_handle)
-		self.handlers[getprocaddr] = argparse.Namespace()
-		self.handlers[getprocaddr].breakpoint = getprocaddr
-		self.handlers[getprocaddr].name = 'GetProcAddress'
+		dbg.bp_set(dbg.func_resolve_debuggee('kernel32.dll', 'GetProcAddress'), handler=self.__gpa_handle)
 
-		# NO USE FOR NOW
+		self.__universal_handle(dbg)
+		#I'll NEED IT ! BECAUSE IF GetProcAddress CALLED WITHOUD UPDATING loaded_modules, IT"S NO USE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 		#loadlibrary = dbg.func_resolve('kernel32.dll', 'LoadLibraryA')
 		#dbg.bp_set(loadlibrary, handler=ll_handle)
+
 		return DBG_CONTINUE
 
-	def __trace_handle(self, dbg):
+	def __trace_pre_process(self, h):
+		if 'file' in h:
+			h['fd'] = open(h['file'], 'w')
+		else:
+			h['fd'] = sys.stdout
+			h['file'] = 'Stdout'
+		if 'colide' in h:
+			h['colide'].setdefault('coverage_ratio_thredshold', 1.0001)
+			if 'file' not in h['colide']:
+				raise
+			h['colide']['file'] = open(h['colide']['file'])
+		h.setdefault('visible_modules', [])
+		h['visible_modules'].append(os.path.basename(self.options['target']).lower())
+		h['inst_stream'] = []
+		h['relay'] = False
+
+	def __trace_post_process(self, h):
+		h['fd'].write('\n'.join(['0x%x'%i for i in h['inst_stream']]))
+		print '[+] Tracing file dumped: %s' % h['file']
+		h['fd'].close()
+
+		if 'colide' in h:
+			h['colide']['file'].close()
+
+	def __trace_start_handle(self, dbg, handler):
+		eip = dbg.context.Eip
+		if not handler['relay']:
+			print '[+] Start tracing at: 0x%x' % eip
+		within = filter(lambda x: x['start']<=eip<=x['end'], map(lambda y:self.loaded_modules[y], handler['visible_modules']))
+		if within:
+			handler['inst_stream'].append(eip-within[0]['start']+within[0]['fake_start'])
 		for thread_id in dbg.enumerate_threads():
-			print '[+] Single step for thread %d' % thread_id
 			# What's the thread used for?
 			h_thread = dbg.open_thread(thread_id)
 			dbg.single_step(True, thread_handle=h_thread)
 			dbg.close_handle(h_thread)
+		self.global_handlers.append({'handle':self.__trace_handle, 'orig_handler':handler})
 		dbg.resume_all_threads()
-
 		return DBG_CONTINUE
 
-	def __singlestep_handle(self, dbg):
+	def __intercept_handler(self, dbg, handler):
+		pass
+
+	def __trace_handle(self, dbg, tmp_handler):
 		eip = dbg.context.Eip
-		self.inst_stream.append(eip)
+		handler = tmp_handler['orig_handler']
 		# If eip is within visible modules, then break at it
-		if filter(lambda x: x[0]<=eip<=x[1], self.module_sections):
+		within = filter(lambda x: x['start']<=eip<=x['end'], map(lambda y:self.loaded_modules[y],handler['visible_modules']))
+		if within:
+			handler['inst_stream'].append(eip-within[0]['start']+within[0]['fake_start'])
 			dbg.single_step(True)
 		# Else, break at return address
 		else:
@@ -294,48 +279,124 @@ class sandbox():
 			ret = struct.unpack("<I", ret)[0]
 
 			# WILL I MISS SOMETHING THAT STARTS IN OTHER MODULE AND END UP IN VISIBLE ONES
-			if filter(lambda x: x[0]<=ret<=x[1], self.module_sections):
-				dbg.bp_set(ret, restore=False, handler=self.__trace_handle)
+			if filter(lambda x: x['start']<=ret<=x['end'], map(lambda y:self.loaded_modules[y], handler['visible_modules'])):
+				# Reuse the handler
+				# Trace should never share a breakpoint with others
+				dbg.bp_del(self.breakpoints[handler['bp']]['addr'])
+				dbg.bp_set(ret, restore=False, handler=self.__universal_handle)
+				self.breakpoints[handler['bp']]['addr'] = ret
+				handler['relay'] = True
+				self.global_handlers.remove(tmp_handler)
 				dbg.single_step(False)
 		return DBG_CONTINUE
 
+	def __getImageBase(self, fname):
+		with open(fname) as f:
+			f.seek(0x3c)
+			nt_header=struct.unpack('<I',f.read(4))[0]
+			f.seek(nt_header + 0x34)
+			imagebase=struct.unpack('<I',f.read(4))[0]
+			return imagebase
 
-	def __dyn_link(self, pe, dbg):
-		modules = dict(map(lambda (name,addr): (name.lower(),addr),dbg.enumerate_modules()))
-		for entry in pe.DIRECTORY_ENTRY_IMPORT:
-			try:
-				module_base = modules[entry.dll.lower()]
-			except:
-				continue
-			for imp in entry.imports:
-				func_name = imp.name
-				if not func_name:
+	def __dyn_link(self):
+		self.loaded_modules = {}
+
+		for module in self.dbg.iterate_modules():
+			self.loaded_modules[module.szModule.lower()] = {
+					'start'		:module.modBaseAddr,
+					'end'		:module.modBaseAddr+module.modBaseSize,
+					'fake_start':self.__getImageBase(module.szExePath)
+					}
+		for i, bp in enumerate(self.breakpoints):
+			bp['resolved'] = True
+			if bp['search']:
+				module, func = bp['addr'].split('@')
+				module = module.lower()
+				if module in self.loaded_modules:
+					bp['addr'] = self.dbg.func_resolve_debuggee(module, func)
+					bp['name'] = func
+					print '[+] Place breakpoint at %s\t0x%x' % (func, bp['addr'])
+				else:
+					bp['resolved'] = False
 					continue
-				# DOES LOWER UPPER MATTER?????????
-				func_addr = dbg.func_resolve(entry.dll, func_name)
-				#func_addr = imp.thunk_rva + module_base
- 
-				for opt in self.options:
-					if opt.search and func_name in opt.breakpoint:
-						print '[+] Forbidden API detected: %s\t0x%x' % (func_name, func_addr)
-						if opt.utils == 'disable':
-							handler = self.__ban_handle
-						elif opt.utils == 'mitm':
-							handler = self.__modify_param_handle
-						elif opt.utils == 'trace':
-							handler = self.__trace_handle
+			elif bp['addr'] == '@oep': 
+				bp['addr'] = self.options['oep']
+				bp['name'] = 'OEP'
+				print '[+] Place breakpoint at %s\t0x%x' % ('oep',bp['addr'])
+			else:
+				print '[+] Place breakpoint at\t0x%x' % bp['addr']
 
-						try:
-							if opt.type == 'hardware':
-								dbg.bp_set_hw(func_addr, 1, HW_EXECUTE, handler=handler)
-							else:
-								dbg.bp_set(func_addr, handler=handler)
-							self.handlers[func_addr] = copy.deepcopy(opt)
-							self.handlers[func_addr].breakpoint = func_addr
-							self.handlers[func_addr].name = func_name
-						except:
-							print '[-] Failed to place breakpoint %s\t0x%x' % (func_name, func_addr)
+			if not bp['search'] or bp['resolved']:
+				try:
+					if bp['type'] == 'hardware':
+						self.dbg.bp_set_hw(bp['addr'], 1, HW_EXECUTE, handler=self.__universal_handle)
+					else:
+						self.dbg.bp_set(bp['addr'], handler=self.__universal_handle)
+				except:
+					print '[-] Failed to place breakpoint\t0x%x' % bp['addr']
 
+	def __universal_handle(self, dbg):
+		eip = dbg.context.Eip
+		for h in self.global_handlers:
+			h['handle'](dbg, h)
+		for bp in filter(lambda x:x['addr']==eip and x['time']!=0, self.breakpoints):
+			handlers = self.handlers[bp['id']] 
+			for h in handlers:
+				if 'pre_action' in h:
+					self.actions[h['pre_action']](dbg)
+			for h in handlers:
+				self.plugins[h['util']]['handler'](dbg, h)
+			for h in handlers:
+				if 'post_action' in h:
+					self.actions[h['post_action']](dbg)
+			self.__handler_count_down(bp)
+		return DBG_CONTINUE
+
+	def post_process(self):
+		for hs in self.handlers.itervalues():
+			for h in hs:
+				if 'pre_process' in self.plugins[h['util']]:
+					self.plugins[h['util']]['post_process'](h)
+
+	def load_project(self, fname):
+		with open(fname) as f:
+			self.options = json.load(f)
+		self.breakpoints = self.options['breakpoints']
+		for i, bp in enumerate(self.breakpoints):
+			if 'addr' not in bp:
+				raise
+			bp.setdefault('search', False)
+			bp.setdefault('name', '')
+			bp.setdefault('action', '')
+			bp.setdefault('time', -1)
+			bp.setdefault('ignore', 0)
+			bp.setdefault('type', 'memory')
+			if not bp["search"]:
+				#if b["addr"] == "oep":
+					# DELAY
+				if type(bp['addr'])!='int' and bp['addr'].startswith('0x'):
+					bp['addr'] = int(b['addr'][2:], 16)
+
+		if 'handlers' in self.options:
+			# Stable sort guaranteed
+			handler_by_bp = itertools.groupby(sorted(self.options['handlers'], key=operator.itemgetter('bp')), operator.itemgetter('bp'))
+			self.handlers = {}
+			for i, item in handler_by_bp:
+				self.handlers[i] = list(item)
+
+		if 'target' not in self.options:
+			raise
+		target = self.options['target']
+		self.dbg.load(target)
+		self.pe = pefile.PE(target)
+		self.oep_rva = self.pe.OPTIONAL_HEADER.AddressOfEntryPoint
+		self.fake_base_of_image = self.pe.OPTIONAL_HEADER.ImageBase
+
+		self.options.setdefault('oep', None)
+		if self.options['oep'] and type(self.options['oep'])!='int' and self.options['oep'].startswith('0x'):
+			self.options['oep'] = int(self.options['oep'], 16)
+
+'''
 def parse_options(args):
 	parser = argparse.ArgumentParser()
 	# Primary general option
@@ -400,15 +461,14 @@ def parse_options(args):
 			else:
 				option.breakpoint[i] = int(bp)
 	return option
+'''
 
 if __name__ == '__main__':
 	# WTF, sys.argv[0]:win32_sandbox.py???
-	options = parse_options(sys.argv[2:])
-	a = sandbox(sys.argv[1], [options])
+	#options = parse_options(sys.argv[2:])
+	a = sandbox()
+	a.load_project(sys.argv[1])
 	a.run()
+	a.post_process()
 
-	# IT'S NOT GOOD TO LEAVE IT HERE
-	if options.utils == 'trace' and options.file:
-		options.file.write('\n'.join(a.inst_stream))
-		options.file.close()
 	print '[*] Exit'
