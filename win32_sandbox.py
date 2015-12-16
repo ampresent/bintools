@@ -227,23 +227,26 @@ class sandbox():
 		else:
 			h['fd'] = sys.stdout
 			h['file'] = 'Stdout'
-		if 'colide' in h:
-			h['colide'].setdefault('coverage_ratio_thredshold', 1.0001)
-			if 'file' not in h['colide']:
+		if 'collide' in h:
+			h['collide'].setdefault('coverage_incremental_thredshold', 5)
+			# The trace file should contain tracing result
+			if 'file' not in h['collide']:
 				raise
-			h['colide']['file'] = open(h['colide']['file'])
+			with open(h['collide']['file']) as f:
+				h['collide']['orig_coverage'] = set(map(lambda x:int(x.strip().split('\t')[1]), f.read().strip().split('\n')))
+				print '[+] Reference coverage information loaded: %s' % h['collide']['file']
+
 		h.setdefault('visible_modules', [])
 		h['visible_modules'].append(os.path.basename(self.options['target']).lower())
 		h['inst_stream'] = []
+		h['inst_stream_rva'] = []
 		h['relay'] = False
+		h['bp_backup'] = self.breakpoints[h['bp']]['addr']
 
 	def __trace_post_process(self, h):
-		h['fd'].write('\n'.join(['0x%x'%i for i in h['inst_stream']]))
+		h['fd'].write('\n'.join(['0x%x\t%d'%i for i in zip(h['inst_stream'], h['inst_stream_rva'])]))
 		print '[+] Tracing file dumped: %s' % h['file']
 		h['fd'].close()
-
-		if 'colide' in h:
-			h['colide']['file'].close()
 
 	def __trace_start_handle(self, dbg, handler):
 		eip = dbg.context.Eip
@@ -252,6 +255,11 @@ class sandbox():
 		within = filter(lambda x: x['start']<=eip<=x['end'], map(lambda y:self.loaded_modules[y], handler['visible_modules']))
 		if within:
 			handler['inst_stream'].append(eip-within[0]['start']+within[0]['fake_start'])
+			handler['inst_stream_rva'].append(eip-within[0]['start'])
+			if 'collide' in handler:
+				if len(set(handler['inst_stream_rva']) - handler['collide']['orig_coverage']) > handler['collide']['coverage_incremental_thredshold']:
+					print '[!] Coverage incremental thredshold exceeded!'
+
 		for thread_id in dbg.enumerate_threads():
 			# What's the thread used for?
 			h_thread = dbg.open_thread(thread_id)
@@ -271,6 +279,12 @@ class sandbox():
 		within = filter(lambda x: x['start']<=eip<=x['end'], map(lambda y:self.loaded_modules[y],handler['visible_modules']))
 		if within:
 			handler['inst_stream'].append(eip-within[0]['start']+within[0]['fake_start'])
+			handler['inst_stream_rva'].append(eip-within[0]['start'])
+			if 'collide' in handler:
+				if len(set(handler['inst_stream_rva']) - handler['collide']['orig_coverage']) > handler['collide']['coverage_incremental_thredshold']:
+					print '[!] Coverage incremental thredshold exceeded!'
+					# ???????????????????????
+					exit(0)
 			dbg.single_step(True)
 		# Else, break at return address
 		else:
@@ -319,12 +333,17 @@ class sandbox():
 				else:
 					bp['resolved'] = False
 					continue
-			elif bp['addr'] == '@oep': 
+			elif bp['addr'] == '@oep':
 				bp['addr'] = self.options['oep']
 				bp['name'] = 'OEP'
 				print '[+] Place breakpoint at %s\t0x%x' % ('oep',bp['addr'])
 			else:
-				print '[+] Place breakpoint at\t0x%x' % bp['addr']
+				within = filter(lambda x: x['fake_start']<=bp['addr']<=x['fake_start']+x['end']-x['start'], self.loaded_modules.itervalues())
+				if not within:
+					raise
+				tmp = bp['addr']
+				bp['addr'] = bp['addr'] - within[0]['fake_start'] + within[0]['start']
+				print '[+] Place breakpoint at\t0x%x --> 0x%x (relocated)' % (tmp, bp['addr'])
 
 			if not bp['search'] or bp['resolved']:
 				try:
@@ -340,7 +359,7 @@ class sandbox():
 		for h in self.global_handlers:
 			h['handle'](dbg, h)
 		for bp in filter(lambda x:x['addr']==eip and x['time']!=0, self.breakpoints):
-			handlers = self.handlers[bp['id']] 
+			handlers = self.handlers[bp['id']]
 			for h in handlers:
 				if 'pre_action' in h:
 					self.actions[h['pre_action']](dbg)
@@ -372,10 +391,10 @@ class sandbox():
 			bp.setdefault('ignore', 0)
 			bp.setdefault('type', 'memory')
 			if not bp["search"]:
-				#if b["addr"] == "oep":
-					# DELAY
+				#if b['add'] == 'oep':
+					# Delay
 				if type(bp['addr'])!='int' and bp['addr'].startswith('0x'):
-					bp['addr'] = int(b['addr'][2:], 16)
+					bp['addr'] = int(bp['addr'][2:], 16)
 
 		if 'handlers' in self.options:
 			# Stable sort guaranteed
@@ -391,10 +410,7 @@ class sandbox():
 		self.pe = pefile.PE(target)
 		self.oep_rva = self.pe.OPTIONAL_HEADER.AddressOfEntryPoint
 		self.fake_base_of_image = self.pe.OPTIONAL_HEADER.ImageBase
-
 		self.options.setdefault('oep', None)
-		if self.options['oep'] and type(self.options['oep'])!='int' and self.options['oep'].startswith('0x'):
-			self.options['oep'] = int(self.options['oep'], 16)
 
 '''
 def parse_options(args):
