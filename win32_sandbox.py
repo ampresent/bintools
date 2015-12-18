@@ -13,48 +13,62 @@ import operator
 
 class sandbox():
 	def __init__(self):
+		# Initialize key variables
 		self.breakpoints = []
 		self.handlers = []
 		self.global_handlers = []
 		self.dbg = pydbg()
-		self.dbg.set_callback(CREATE_PROCESS_DEBUG_EVENT, self.__create_process_handle)
-		self.dbg.set_callback(EXCEPTION_SINGLE_STEP, self.__universal_handle)
-		self.plugins = {
-			'disable': {'handler': self.__disable_handle},
-			'trace': {'pre_process': self.__trace_pre_process, 'handler': self.__trace_start_handle, 'post_process': self.__trace_post_process},
-			'mitm':{'handler': self.__mitm_handle},
-			'intercept':{'handler':self.__intercept_handler}
-		}
+		self.plugins = {}
 
-	# Run the debugger
+		# The starting work
+		self.dbg.set_callback(CREATE_PROCESS_DEBUG_EVENT, self.__create_process_handle)
+		# self.__universal_handle takes over single_step (And all other breakpoints later on)
+		self.dbg.set_callback(EXCEPTION_SINGLE_STEP, self.__universal_handle)
+
+		# These are the primary plugins
+		self._register_new_plugin('disable', self.__disable_handle, None, None)
+		# Note that a collide file is shrinked , than a regular trace file
+		self._register_new_plugin('trace', self.__trace_start_handle, self.__trace_pre_process, self.__trace_post_process)
+		self._register_new_plugin('mitm', self.__mitm_handle, None, None)
+		self._register_new_plugin('intercept', self.__intercept_handle, None, None)
+
+	# Register new plugins, can be called in child class, to extend the functionality
+	def _register_new_plugin(self, name, handle, pre_process, post_process):
+		if name in self.plugins:
+			raise NameError
+		self.plugins[name] = {'handler':handle, 'pre_process':pre_process, 'post_process':post_process}
+
+	# Run the debugger and the debuggee
 	def run(self):
+		print '[+] Start debugging'
 		self.dbg.run()
 
-	# Works with self.handlers
+	# Disable apis/part of functions by jumping to the ret address
 	def __disable_handle(self, dbg, handler):
-		func_addr = dbg.context.Eip
+		eip = dbg.context.Eip
+		# Breakpoint doesn't necessarily have a name, empty by default
 		func_name = self.breakpoints[handler['bp']]['name']
-		print '[+] Banning API: %s\t0x%x' % (func_name, func_addr)
-		det = 1
-		# There should be range detection???
+		print '[+] Banning API: %s\t0x%x' % (func_name, eip)
+		ptr = eip
 		while True:
-			ins = dbg.disasm_around(func_addr, det)[-1]
-			if ins[1].startswith('retn'):
+			ins = dbg.disasm_around(ptr, 1)
+			if ins[1][1].startswith('ret'):
 				# jump to retn n, what if there's no retn? there's the chance
-				dbg.set_register('EIP', ins[0])
+				dbg.set_register('EIP', ins[1][0])
 				break
-			det += 1
-
+			ptr = ins[2][0]
 		return DBG_CONTINUE
 
+	# Deal with Runtime function resolve,  which has been filtered by
+	# the load time function resolve: self.__dyn_link
 	def __gpa_ret_handle(self, dbg):
+		# Return value of GetProcAddress
 		func_addr = dbg.context.Eax
 		func_name = self.last_dyn_API
-
 		for i, bp in enumerate(self.breakpoints):
+			# Check if it's not been filtered
 			if bp['search'] and not bp['resolved']:
 				module, func = bp['addr'].split('@')
-				# I SHOULD DEAL WITH module!!!!!!!
 				module = module.lower()
 				if func == func_name:
 					bp['addr'] = func_addr
@@ -67,27 +81,39 @@ class sandbox():
 
 		return DBG_CONTINUE
 
-	# Not of much use, only to retrieve func_name, and set breakpoint on retn
+	# Works with __gpa_ret_handle, because GetProcAddress's return value
+	# should be captured in the __gpa_ret_handle
 	def __gpa_handle(self, dbg):
 		esp = dbg.context.Esp
 		ret = struct.unpack('<I', dbg.read(esp, 4))[0]
 		func_name_ptr = struct.unpack('<I', dbg.read(esp+8, 4))[0]
+		func_name = ''
 		try:
-			# Should check the range
-			func_name = dbg.read(func_name_ptr, 50)
+			func_name = dbg.read(func_name_ptr, 30)
 		except:
-			# Strange, a lot of failed ones
-			#print '[-] Parsing function at 0x%x failed, ignore' % func_name_ptr
+			# if func_name exceeded the length, then try shorter name
+			for i in range(30, 0, -1):
+				try:
+					func_name = dbg.read(func_name_ptr, i)
+					break
+				except:
+					pass
+		# A functions which cannot detect the name
+		# will not be a valid API breakpoint either
+		if not func_name:
 			return DBG_CONTINUE
 		func_name = dbg.get_ascii_string(func_name)
-		# Func_addr unknown yet until GetProcAddress returns
-		#print '[+] Forbidden API detected: %s' % func_name
 		# Execute Until Return
 		dbg.bp_set(ret, restore=False, handler=self.__gpa_ret_handle)
+		# THERES THE MULTITHREAD PROBLEM!!!!!!!!!!!!!!!!!!!!!!!!
+		# BUT NOT OF A HUGE TROBLE
+		# Record the function name so the
 		self.last_dyn_API = func_name
 		return DBG_CONTINUE
 
-	# STILL FAULTY COMPLETELY
+	# STILL FAULTY COMPLETELY!!!!!!!!!!!!!!!!!!!!!!!!!
+	# IT'S NEEDED BECAUSE loaded_module and visible_module etc.
+	# SHOULD BE UPDATED AT RUNTIME!!!!!!!!!!!!!1
 	'''
 	def ll_handle(dbg):
 		esp = dbg.context.Esp
@@ -111,30 +137,56 @@ class sandbox():
 	'''
 
 	# Works with self.handlers
-	def __handler_count_down(self, bp):
-		if bp['time'] > 0:
-			bp['time'] -= 1
-			if bp['time'] == 0:
-				print '[*] Handler expired at: %s\t0x%x' % (bp['name'], bp['addr'])
-				if bp['time'] == 'hardware':
-					self.dbg.bp_del_hw(bp['addr'])
-				else:
-					self.dbg.bp_del(bp['addr'])
-
-	# Works with self.handlers
-	def __mitm_handle(self, dbg):
+	def __mitm_handle(self, dbg, handler):
 		eip = dbg.context.Eip
-		if self.handlers[eip].offset:
+		# two addressing method now. Offset to esp / Absolute VA
+		if handler['addressing'] == 'toesp':
 			esp = dbg.context.Esp
-			addr = esp + self.handlers[eip].offset
-		elif self.handlers[eip].address:
-			addr = self.handlers[eip].address
-		# If indirect specified , lookup addres
-		if self.handlers[eip].indirect:
-			param = dbg.read(addr, 4)
-			param = struct.unpack('<I', param)[0]
-			addr = param
+			addr = esp + handlers['addr']
+		elif handler['addressing'] == 'absolute':
+			# WRONG!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+			# ALL ADDRESS INPUT FROM PROJ FILE SHOULD BE RELOCATED!!!!!!!!!!!!!!!!!!!!!!!!!
+			# IT'S AN ADDRESS
+			addr = self.handlers['addr']
+		# If indirect specified , lookup address
+		if handler['indirect']:
+			addr = struct.unpack('<I', dbg.read(addr, 4))[0]
 
+		# mutator should be imported, and INSTANCTIATED!!! duaring __mitm_pre_process
+
+		# provide sufficient context infomation for mutator
+		# SO MITM MODULE CARRYING SOME SPECIFIC MUTATOR MUST BE PUT BEFORE TRACE MODULE,
+		# OR TRACE MODULE WILL ERASE THE COLLIDE_SET AT FIRST!!!!!!!!!!!!!
+		handler['mutator'].set_context(dbg, handler)
+		# get request len from mutator
+		request_len = handler['mutator'].get_request_length()
+		# request memory from debuggee
+		request = dbg.read(addr, request_len)
+		# get ripe request out of raw
+		request = handler['mutator'].cook(request)
+		# mutate ripe request into response
+		response = handler['mutator'].mutate(request)
+		# they must have the same size, or system will thrash
+		# an exception: string can terminate earlier
+		dbg.write(addr, response, request_len)
+
+		request_display = handler['mutator'].display(request)
+		response_display = handler['mutator'].display(response)
+
+		# Strip if too long
+		if len(request_display) > 53:
+			request_display = request_display[0:50] + '...'
+		if len(response_display) > 53:
+			response_display = response_display[0:50] + '...'
+
+		if handler['addressing'] == 'toesp':
+			print '[+] Param offset to esp %d: %s\n[+] Changed into %s' %
+				(handler['address'], request_display, response_display)
+		elif handler['addressing'] == 'absolute':
+			print '[+] Data at address 0x%x: %s\n[+] Changed into %s' %
+				(handler['address'], request_display, response_display)
+
+		'''
 		display = self.handlers[eip].display
 		if display == '%s':
 			into = self.handlers[eip].into
@@ -188,24 +240,28 @@ class sandbox():
 			print '[+] Param on the stack: 0x%s' % (param[0:20]+'...' if length > 20 else param)
 			print '[+] \tChanged into: %s' % (self.handlers[eip].into[0:20]+'...' if length>20 else self.handlers[eip].into)
 			dbg.write(addr, into, length)
-		self.__handler_count_down(eip)
+		'''
 		return DBG_CONTINUE
 
+	# All the prepare work before run.
 	def __create_process_handle(self, dbg):
+		# Get the base of image, to relocate oep
 		self.base_of_image = dbg.dbg.u.CreateProcessInfo.lpBaseOfImage
-		# Only one option should contain oep, or only root option should contain oep, how to guarantee???????????
-		if not self.options['oep']:
-			self.options['oep'] = self.oep_rva + self.base_of_image
-		else:
+		# If oep is specified in the project file, then relocate it
+		if self.options['oep']:
 			self.options['oep'] = self.options['oep']-self.fake_base_of_image+self.base_of_image
+		# If not, then read and compute from the PE file
+		else:
+			self.options['oep'] = self.oep_rva + self.base_of_image
 		dbg.bp_set(self.options['oep'], restore=False, handler=self.__oep_handle)
-
+		# Prepare work of handlers (and the plugins they classified to)
 		for hs in self.handlers.itervalues():
 			for h in hs:
-				if 'pre_process' in self.plugins[h['util']]:
+				if self.plugins[h['util']]['pre_process']:
 					self.plugins[h['util']]['pre_process'](h)
 		return DBG_CONTINUE
 
+	# Still prepare work, (Runtime prepare work)
 	def __oep_handle(self, dbg):
 		print '[*] Breaking on OEP: 0x%x' % dbg.context.Eip
 		# Enumerate modules loaded for now
@@ -221,106 +277,182 @@ class sandbox():
 
 		return DBG_CONTINUE
 
+	def __relocate_addr_loaded_module(self, addr):
+		# Determin which module is 'addr' in
+		within = filter(lambda x: x['fake_start']<=addr<=x['fake_start']+x['end']-x['start'], self.loaded_modules.itervalues())
+		if not within or len(within) > 1:
+			raise
+		# Get the va out of fake va
+		return addr - within[0]['fake_start'] + within[0]['start']
+
+	# The prepare work of trace plugin
 	def __trace_pre_process(self, h):
+		# Trace file output, if not specifed, use stdout
 		if 'file' in h:
 			h['fd'] = open(h['file'], 'w')
 		else:
 			h['fd'] = sys.stdout
+			# set \filename\ to Stdout
 			h['file'] = 'Stdout'
+		# Collide function of trace
 		if 'collide' in h:
 			h['collide'].setdefault('coverage_incremental_thredshold', 5)
-			# The trace file should contain tracing result
+			h['collide'].setdefault('thredshold_step', 0)
 			if 'file' not in h['collide']:
 				raise
 			with open(h['collide']['file']) as f:
+				# Read trace rva into orig_coverage as a set
 				h['collide']['orig_coverage'] = set(map(lambda x:int(x.strip().split('\t')[1]), f.read().strip().split('\n')))
 				print '[+] Reference coverage information loaded: %s' % h['collide']['file']
+			# Clean the collide_set
+			h['collide']['collide_set'] = set()
+			# At the start of trace, thredshold += thredshold_step, so back to real value
+			h['collide']['coverage_incremental_thredshold'] -= h['collide']['thredshold_step']
+		# IT'S AN ADDRESS
+		if 'until' in h:
+			if h['until'].startswith('0x'):
+				h['until'] = int(h['until'][2:], 16)
+			# RUNTIME BREAKPOINT
+			if h['until'] == '@ret':
+				pass
+			# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!RUNTIME TOO!!!!!!!!!!!!!!!!!!!!
+			elif '@' in h['until']:
+				module, func = h['until'].split('@')
+				module = module.lower()
+				h['until'] = sef.dbg.func_resolve_debuggee(module, func)
+			# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!RUNTIME TOO!!!!!!!!!!!!!!!!!!!!
+			else:
+				h['until'] = self.__relocate_addr_loaded_module(h['until'])
 
 		h.setdefault('visible_modules', [])
+		# Only program visible by default
 		h['visible_modules'].append(os.path.basename(self.options['target']).lower())
 		h['inst_stream'] = []
 		h['inst_stream_rva'] = []
+		# Don't print relay breakpoint ( that is, reused )
 		h['relay'] = False
+		# Backup the breakpoint of trace, to restore the relayed handler to original
+		# when reached 'until' ( on if 'until' specified)
 		h['bp_backup'] = self.breakpoints[h['bp']]['addr']
 
+	# The post process of trace, just dump trace/collide file
 	def __trace_post_process(self, h):
 		h['fd'].write('\n'.join(['0x%x\t%d'%i for i in zip(h['inst_stream'], h['inst_stream_rva'])]))
 		print '[+] Tracing file dumped: %s' % h['file']
 		h['fd'].close()
 
+	def __trace_main(self, dbg, handler, global_handler=None):
+		eip = dbg.context.Eip
+		# If within visible modules
+		within = filter(lambda x: x['start']<=eip<=x['end'], map(lambda y:self.loaded_modules[y], handler['visible_modules']))
+		if not within:
+			return False
+		if len(within) > 1:
+			raise
+		# Record the trace file
+		handler['inst_stream'].append(eip-within[0]['start']+within[0]['fake_start'])
+		handler['inst_stream_rva'].append(eip-within[0]['start'])
+		dbg.single_step(True)
+		meet = False
+		if 'collide' in handler:
+			handler['collide']['collide_set'].add(eip-within[0]['start'])
+			if len(handler['collide']['collide_set'] - handler['collide']['orig_coverage']) > handler['collide']['coverage_incremental_thredshold']:
+				print '[!] Coverage incremental thredshold exceeded!\n\tAnd overlapped 0x%x!' % eip
+				# if collide successfully, mute in advance
+				meet = True
+		# Whether met until
+		if 'until' in handler:
+			# IT'S AN ADDRESS
+			if handler['until'] == '@ret':
+				ins = dbg.disasm_around(eip, 0)[0][1]
+				if ins.startswith('ret'):
+					meet = True
+			elif eip == handler['until']:
+				meet = True
+			if meet:
+				print '[+] Traced until: 0x%x\n' % eip
+				# restore the (maybe) relayed handler to the original one
+				# WRONG !!!!!!!!!!!WHAT IF HARDWARE!!!!!!!!!!!!
+				dbg.bp_del(self.breakpoints[handler['bp']]['addr'])
+				dbg.bp_set(handler['bp_backup'], restore=False, handler=self.__universal_handle)
+				self.breakpoints[handler['bp']]['addr'] = handler['bp_backup']
+				if global_handler:
+					self.global_handlers.remove(tmp_handler)
+				handler['relay'] = False
+				# Mute single_step
+				dbg.single_step(False)
+		return True
+	# The real handle of trace, which will start a sub-handler (global)
 	def __trace_start_handle(self, dbg, handler):
 		eip = dbg.context.Eip
 		if not handler['relay']:
 			print '[+] Start tracing at: 0x%x' % eip
-		within = filter(lambda x: x['start']<=eip<=x['end'], map(lambda y:self.loaded_modules[y], handler['visible_modules']))
-		if within:
-			handler['inst_stream'].append(eip-within[0]['start']+within[0]['fake_start'])
-			handler['inst_stream_rva'].append(eip-within[0]['start'])
 			if 'collide' in handler:
-				if len(set(handler['inst_stream_rva']) - handler['collide']['orig_coverage']) > handler['collide']['coverage_incremental_thredshold']:
-					print '[!] Coverage incremental thredshold exceeded!'
-
+				# A new cycle with an empty collide_set, and a increased thredshold
+				handler['collide']['collide_set'] = set()
+				handler['collide']['coverage_incremental_thredshold'] += handler['collide']['thredshold_step']
+				print '[+] Start colliding, thredshold: %d' % handler['collide']['coverage_incremental_thread']
+		self.__trace_main(dbg, handler, None)
 		for thread_id in dbg.enumerate_threads():
-			# What's the thread used for?
+			# What's the thread used for???
 			h_thread = dbg.open_thread(thread_id)
 			dbg.single_step(True, thread_handle=h_thread)
 			dbg.close_handle(h_thread)
+		# start a sub-handler
 		self.global_handlers.append({'handle':self.__trace_handle, 'orig_handler':handler})
 		dbg.resume_all_threads()
 		return DBG_CONTINUE
 
-	def __intercept_handler(self, dbg, handler):
+	def __intercept_handle(self, dbg, handler):
 		pass
 
 	def __trace_handle(self, dbg, tmp_handler):
 		eip = dbg.context.Eip
 		handler = tmp_handler['orig_handler']
-		# If eip is within visible modules, then break at it
-		within = filter(lambda x: x['start']<=eip<=x['end'], map(lambda y:self.loaded_modules[y],handler['visible_modules']))
-		if within:
-			handler['inst_stream'].append(eip-within[0]['start']+within[0]['fake_start'])
-			handler['inst_stream_rva'].append(eip-within[0]['start'])
-			if 'collide' in handler:
-				if len(set(handler['inst_stream_rva']) - handler['collide']['orig_coverage']) > handler['collide']['coverage_incremental_thredshold']:
-					print '[!] Coverage incremental thredshold exceeded!'
-					# ???????????????????????
-					exit(0)
-			dbg.single_step(True)
-		# Else, break at return address
-		else:
-			esp = dbg.context.Esp
-			ret = dbg.read(esp, 4)
-			ret = struct.unpack("<I", ret)[0]
+		# If breaked at next instruction successfully
+		if self.__trace_main(self, dbg, handler, tmp_handler):
+			return DBG_CONTINUE
+		# If failed, break at the return address
+		esp = dbg.context.Esp
+		ret = dbg.read(esp, 4)
+		ret = struct.unpack("<I", ret)[0]
 
-			# WILL I MISS SOMETHING THAT STARTS IN OTHER MODULE AND END UP IN VISIBLE ONES
-			if filter(lambda x: x['start']<=ret<=x['end'], map(lambda y:self.loaded_modules[y], handler['visible_modules'])):
-				# Reuse the handler
-				# Trace should never share a breakpoint with others
-				dbg.bp_del(self.breakpoints[handler['bp']]['addr'])
-				dbg.bp_set(ret, restore=False, handler=self.__universal_handle)
-				self.breakpoints[handler['bp']]['addr'] = ret
-				handler['relay'] = True
-				self.global_handlers.remove(tmp_handler)
-				dbg.single_step(False)
+		# WILL I MISS SOMETHING THAT STARTS IN OTHER MODULE AND END UP IN VISIBLE ONES????
+		if filter(lambda x: x['start']<=ret<=x['end'], map(lambda y:self.loaded_modules[y], handler['visible_modules'])):
+			# Reuse the handler
+			# Trace should never share a breakpoint with others
+			# WRONG !!!!!!!!!!!WHAT IF HARDWARE!!!!!!!!!!!!
+			dbg.bp_del(self.breakpoints[handler['bp']]['addr'])
+			dbg.bp_set(ret, restore=False, handler=self.__universal_handle)
+			self.breakpoints[handler['bp']]['addr'] = ret
+			handler['relay'] = True
+			self.global_handlers.remove(tmp_handler)
+			dbg.single_step(False)
 		return DBG_CONTINUE
 
+	# get ImageBase in the optional NT header
 	def __getImageBase(self, fname):
 		with open(fname) as f:
+			# offset of address of NT header
 			f.seek(0x3c)
 			nt_header=struct.unpack('<I',f.read(4))[0]
+			# offset of ImageBase
 			f.seek(nt_header + 0x34)
 			imagebase=struct.unpack('<I',f.read(4))[0]
 			return imagebase
 
+	# All about load-time
 	def __dyn_link(self):
 		self.loaded_modules = {}
 
+		# SHOULD BE UPDATED
 		for module in self.dbg.iterate_modules():
 			self.loaded_modules[module.szModule.lower()] = {
 					'start'		:module.modBaseAddr,
 					'end'		:module.modBaseAddr+module.modBaseSize,
 					'fake_start':self.__getImageBase(module.szExePath)
 					}
+		# IT'S AN ADDRESS
 		for i, bp in enumerate(self.breakpoints):
 			bp['resolved'] = True
 			if bp['search']:
@@ -354,33 +486,50 @@ class sandbox():
 				except:
 					print '[-] Failed to place breakpoint\t0x%x' % bp['addr']
 
+	# The center of breakpoints and handlers
 	def __universal_handle(self, dbg):
 		eip = dbg.context.Eip
+		# Global handlers have no expire now
 		for h in self.global_handlers:
 			h['handle'](dbg, h)
+		# Get breakpoints at eip
 		for bp in filter(lambda x:x['addr']==eip and x['time']!=0, self.breakpoints):
+			# Get handlers at bp
 			handlers = self.handlers[bp['id']]
-			for h in handlers:
-				if 'pre_action' in h:
-					self.actions[h['pre_action']](dbg)
+			# Pre actions of all breakpoints
+			if 'pre_action' in bp:
+				self.actions[bp['pre_action']](dbg)
+			# Each handler called once
 			for h in handlers:
 				self.plugins[h['util']]['handler'](dbg, h)
-			for h in handlers:
-				if 'post_action' in h:
-					self.actions[h['post_action']](dbg)
-			self.__handler_count_down(bp)
+			# Post actions of all breakpoints
+			if 'post_action' in h:
+				self.actions[bp['post_action']](dbg)
+			# Expire
+			if bp['time'] > 0:
+				bp['time'] -= 1
+				if bp['time'] == 0:
+					print '[*] Handler expired at: %s\t0x%x' % (bp['name'], bp['addr'])
+					if bp['time'] == 'hardware':
+						self.dbg.bp_del_hw(bp['addr'])
+					else:
+						self.dbg.bp_del(bp['addr'])
 		return DBG_CONTINUE
 
+	# A user interface to dispose all handlers
+	# Global handlers have no post_process now
 	def post_process(self):
 		for hs in self.handlers.itervalues():
 			for h in hs:
-				if 'pre_process' in self.plugins[h['util']]:
+				if self.plugins[h['util']]['post_process']:
 					self.plugins[h['util']]['post_process'](h)
 
+	# Load .json project file
 	def load_project(self, fname):
 		with open(fname) as f:
 			self.options = json.load(f)
-		self.breakpoints = self.options['breakpoints']
+		if 'breakpoints' in self.breakpoints:
+			self.breakpoints = self.options['breakpoints']
 		for i, bp in enumerate(self.breakpoints):
 			if 'addr' not in bp:
 				raise
@@ -390,98 +539,29 @@ class sandbox():
 			bp.setdefault('time', -1)
 			bp.setdefault('ignore', 0)
 			bp.setdefault('type', 'memory')
+			# IT'S AN ADDRESS
 			if not bp["search"]:
-				#if b['add'] == 'oep':
-					# Delay
 				if type(bp['addr'])!='int' and bp['addr'].startswith('0x'):
 					bp['addr'] = int(bp['addr'][2:], 16)
-
+		# Index handlers by bp
+		# Hanlders dont't implement much operation here because
+		# 	many options should be determined at runtime
 		if 'handlers' in self.options:
 			# Stable sort guaranteed
 			handler_by_bp = itertools.groupby(sorted(self.options['handlers'], key=operator.itemgetter('bp')), operator.itemgetter('bp'))
 			self.handlers = {}
 			for i, item in handler_by_bp:
 				self.handlers[i] = list(item)
-
 		if 'target' not in self.options:
 			raise
 		target = self.options['target']
 		self.dbg.load(target)
-		self.pe = pefile.PE(target)
-		self.oep_rva = self.pe.OPTIONAL_HEADER.AddressOfEntryPoint
-		self.fake_base_of_image = self.pe.OPTIONAL_HEADER.ImageBase
+		pe = pefile.PE(target)
+		self.oep_rva = pe.OPTIONAL_HEADER.AddressOfEntryPoint
+		self.fake_base_of_image = pe.OPTIONAL_HEADER.ImageBase
 		self.options.setdefault('oep', None)
 
-'''
-def parse_options(args):
-	parser = argparse.ArgumentParser()
-	# Primary general option
-	parser.add_argument('--oep', action='store', dest='oep', help='Specify OEP.')
-	parser.add_argument('-b', action='store', dest='breakpoint', required=True, help='Breakpoint. API name/Address/"oep", depending on -s', nargs='+')
-	parser.add_argument('--no-search', action='store_false', dest='search', default=True, help='Don\'t search for the name, given by -b. Search by default')
-	parser.add_argument('-t', action='store', choices=['hardware', 'memory'], dest='type', default='memory', help='Type of breakpoint. Memory by default')
-	parser.add_argument('--time', action='store', type=int, dest='time', default='-1', help='Time to live for the handler')
-	subparses = parser.add_subparsers(title='Utils', dest='utils', help='USE %(prog)s disable -h OR %(prog)s mitm -h FOR DETAILS')
-	# Options for disable module
-	parser_disable = subparses.add_parser('disable', help='Disable specified APIs.')
-	parser_disable.add_argument('-i', '--interactive', action='store_true', dest='interactive', default=False, help='Prompt before disabling')
-	# Options for mitm module
-	parser_mitm = subparses.add_parser('mitm', help='Man in the Middle')
-	parser_mitm.add_argument('--indirect', action='store_true', dest='indirect', default=False, help='Indirect Address. False by default')
-	group = parser_mitm.add_mutually_exclusive_group(required=True)
-	group.add_argument('--offset', action='store', dest='offset', help='Bytes offset to the param from esp')
-	group.add_argument('--address', action='store', dest='address', help='Absolute address to modify data')
-	parser_mitm.add_argument('--length', action='store', type=int, dest='length', help='The length of the continuous memory')
-	parser_mitm.add_argument('--into', type=argparse.FileType('r'), default=sys.stdin, dest='into', help='Change bytes into')
-	parser_mitm.add_argument('--display', action='store', choices=['%s', '%d', '%l', '%x', '%b'],
-								default='%s', dest='display', help='Format of displaying')
-	# Options for trace module
-	parser_trace = subparses.add_parser('trace', help='Trace the execution of instructions.')
-	parser_trace.add_argument('-f', type=argparse.FileType('w'), required=True, action='store', dest='file', help='Output File')
-	parser_trace.add_argument('-m', action='append', dest='module', help='Visible Modules')
-	#
-	parser.add_argument('-l', action='store', dest='log', help='Log filename. Not supported yet.')
-	parser.add_argument('-c', action='store', dest='crash-report', help='Crash report filename. Not supported yet.')
-
-	option = parser.parse_args(args)
-
-	# MITM argument check
-	if option.utils == 'mitm':
-		if option.offset:
-			if option.offset.startswith('0x'):
-				option.offset = int(option.offset[2:], 16)
-			else:
-				option.offset = int(option.offset, 16)
-			option.r
-		elif option.address:
-			if option.address.startswith('0x'):
-				option.address = int(option.address[2:], 16)
-			else:
-				option.address = int(option.address, 16)
-		else:
-			raise
-		raw = option.into.read().strip()
-		option.into.close()
-		option.into = raw
-		if  option.display == '%s' and len(option.into)!=option.length:
-			sys.stderr.write('[-] Length is incompatible with into')
-			exit(0)
-
-	# Translate breakpoint into integer
-	if not option.search:
-		for i, bp in enumerate(option.breakpoint):
-			if bp == 'oep':
-				option.search = True
-			elif bp.startswith('0x'):
-				option.breakpoint[i] = int(bp[2:], 16)
-			else:
-				option.breakpoint[i] = int(bp)
-	return option
-'''
-
 if __name__ == '__main__':
-	# WTF, sys.argv[0]:win32_sandbox.py???
-	#options = parse_options(sys.argv[2:])
 	a = sandbox()
 	a.load_project(sys.argv[1])
 	a.run()
