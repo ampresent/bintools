@@ -77,7 +77,11 @@ class sandbox():
 			raise
 		handler['mutator'].setdefault('args', {})
 		if 'name' not in handler:
-			handler['mutator']['object'] = getattr(mutator, handler['mutator']['name'])(handler['mutator']['args'])
+			try:
+				handler['mutator']['object'] = getattr(mutator, handler['mutator']['name'])(handler['mutator']['args'])
+			except:
+				print '[-] Invalied mutator or argument'
+				exit(1)
 	
 	def __bp_del(self, bp):
 		if bp['time'] == 'hardware':
