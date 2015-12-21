@@ -7,10 +7,12 @@ import argparse
 import copy
 import os
 import json
-import hexsed
 import itertools
 import operator
+import mutator
 
+# Handler should have its ID too!!!!
+# For convinience of module connection like mitm - trace !!!!
 class sandbox():
 	def __init__(self):
 		# Initialize key variables
@@ -29,8 +31,18 @@ class sandbox():
 		self._register_new_plugin('disable', self.__disable_handle, None, None)
 		# Note that a collide file is shrinked , than a regular trace file
 		self._register_new_plugin('trace', self.__trace_start_handle, self.__trace_pre_process, self.__trace_post_process)
-		self._register_new_plugin('mitm', self.__mitm_handle, None, None)
+		self._register_new_plugin('mitm', self.__mitm_handle, self.__mitm_pre_process, None)
 		self._register_new_plugin('intercept', self.__intercept_handle, None, None)
+		self.__actions = {'snapshot': self.__take_snapshot ,'restore': self.__restore_snapshot}
+	
+	# ADDR TO MODULE METHOD OF PYDBG!!!!!!!!!!!!!!!!!!!!!
+
+	def __take_snapshot(self, dbg):
+		# THIS DIDN'T EXECUTE???????????????
+		# ALL THREADS SUSPENDED????????!!!!!!!!!!!!!!!
+		dbg.process_snapshot()
+	def __restore_snapshot(self, dbg):
+		dbg.process_restore()
 
 	# Register new plugins, can be called in child class, to extend the functionality
 	def _register_new_plugin(self, name, handle, pre_process, post_process):
@@ -59,6 +71,33 @@ class sandbox():
 			ptr = ins[2][0]
 		return DBG_CONTINUE
 
+	def __mitm_pre_process(self, handler):
+		if 'mutator' not in handler:
+			'[-] Invalid mutator'
+			raise
+		handler['mutator'].setdefault('args', {})
+		if 'name' not in handler:
+			handler['mutator']['object'] = getattr(mutator, handler['mutator']['name'])(handler['mutator']['args'])
+	
+	def __bp_del(self, bp):
+		if bp['time'] == 'hardware':
+			self.dbg.bp_del_hw(bp['addr'])
+		else:
+			self.dbg.bp_del(bp['addr'])
+	def __bp_set(self, bp, handler, restore=True):
+		if bp['type'] == 'hardware':
+			self.dbg.bp_set_hw(bp['addr'], 1, HW_EXECUTE, restore=restore, handler=handler)
+		else:
+			self.dbg.bp_set(bp['addr'], restore=restore, handler=handler)
+	def __bp_update(self, bp, addr, handler, restore=True):
+		if bp['type'] == 'hardware':
+			self.dbg.bp_del_hw(bp['addr'])
+			self.dbg.bp_set_hw(addr, 1, HW_EXECUTE, restore=restore, handler=handler)
+		else:
+			self.dbg.bp_del(bp['addr'])
+			self.dbg.bp_set(addr, restore=restore, handler=handler)
+		bp['addr'] = addr
+
 	# Deal with Runtime function resolve,  which has been filtered by
 	# the load time function resolve: self.__dyn_link
 	def __gpa_ret_handle(self, dbg):
@@ -67,18 +106,17 @@ class sandbox():
 		func_name = self.last_dyn_API
 		for i, bp in enumerate(self.breakpoints):
 			# Check if it's not been filtered
-			if bp['search'] and not bp['resolved']:
+			if not bp['resolved'] and '@' in bp['addr']:
 				module, func = bp['addr'].split('@')
 				module = module.lower()
+				# I SHOULD DISTINGUISH MODULES !!!!!!
 				if func == func_name:
 					bp['addr'] = func_addr
 					bp['name'] = func_name
 					print '[+] Place breakpoint on %s:0x%x' % (func_name,func_addr)
-					if bp['type'] == 'hardware':
-						dbg.bp_set_hw(func_addr, 1, HW_EXECUTE, handler=self.__universal_handle)
-					else:
-						dbg.bp_set(func_addr, handler=self.__universal_handle)
-
+					if not bp['passive']:
+						self.__bp_set(bp, self.__universal_handle)
+					bp['resolved'] = True
 		return DBG_CONTINUE
 
 	# Works with __gpa_ret_handle, because GetProcAddress's return value
@@ -138,40 +176,84 @@ class sandbox():
 
 	# Works with self.handlers
 	def __mitm_handle(self, dbg, handler):
+		# I need to only observe too!!!!!!!!!!!!!!!!!!
 		eip = dbg.context.Eip
-		# two addressing method now. Offset to esp / Absolute VA
-		if handler['addressing'] == 'toesp':
-			esp = dbg.context.Esp
-			addr = esp + handlers['addr']
+		# two addressing method now. Offset to xxx / Absolute VA
+		if handler['addressing'] == 'esp':
+			base = dbg.context.Esp
+			# IT'S AN ADDRESS
+			addr = base + handler['addr']
+		if handler['addressing'] == 'ebp':
+			base = dbg.context.Ebp
+			addr = base + handler['addr']
+		elif handler['addressing'] == 'eax':
+			base = dbg.context.Eax
+			addr = base + handler['addr']
+		elif handler['addressing'] == 'ebx':
+			base = dbg.context.Ebx
+			addr = base + handler['addr']
+		elif handler['addressing'] == 'ecx':
+			base = dbg.context.Ecx
+			addr = base + handler['addr']
+		elif handler['addressing'] == 'edx':
+			base = dbg.context.Edx
+			addr = base + handler['addr']
+		elif handler['addressing'] == 'esi':
+			base = dbg.context.Esi
+			addr = base + handler['addr']
+		elif handler['addressing'] == 'edi':
+			base = dbg.context.Edi
+			addr = base + handler['addr']
 		elif handler['addressing'] == 'absolute':
 			# WRONG!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 			# ALL ADDRESS INPUT FROM PROJ FILE SHOULD BE RELOCATED!!!!!!!!!!!!!!!!!!!!!!!!!
 			# IT'S AN ADDRESS
-			addr = self.handlers['addr']
+			addr = handler['addr']
+		else:
+			raise
 		# If indirect specified , lookup address
+		# THIS DIRECT IS INDIRECT ALREADY!!!!!!!!!!!!!!!!!!!!!!!! I SHOULD MODIFY REGISTERS DIRECTLY !!!!
 		if handler['indirect']:
 			addr = struct.unpack('<I', dbg.read(addr, 4))[0]
+
+		# I SHOULD SUPPORT EXTERNAL STORAGE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 		# mutator should be imported, and INSTANCTIATED!!! duaring __mitm_pre_process
 
 		# provide sufficient context infomation for mutator
 		# SO MITM MODULE CARRYING SOME SPECIFIC MUTATOR MUST BE PUT BEFORE TRACE MODULE,
 		# OR TRACE MODULE WILL ERASE THE COLLIDE_SET AT FIRST!!!!!!!!!!!!!
-		handler['mutator'].set_context(dbg, handler)
-		# get request len from mutator
-		request_len = handler['mutator'].get_request_length()
-		# request memory from debuggee
-		request = dbg.read(addr, request_len)
-		# get ripe request out of raw
-		request = handler['mutator'].cook(request)
-		# mutate ripe request into response
-		response = handler['mutator'].mutate(request)
-		# they must have the same size, or system will thrash
-		# an exception: string can terminate earlier
-		dbg.write(addr, response, request_len)
+		# I SHOULD PROVIDE PLAIN TEXT BESIDES MUTATOR!!!!!!!!!!!
+		try:
+			handler['mutator']['object'].set_context(self, dbg, handler)
+			# get request len from mutator
+			request_len = handler['mutator']['object'].get_request_len()
+			# request memory from debuggee
+			if request_len == -1:
+				request = dbg.smart_dereference(addr, True)
+				request_len = len(request)
+			else:
+				request = dbg.read(addr, request_len)
+		except:
+			print '[-] Failed to read from debuggee'
+			return
+		try:
+			# get ripe request out of raw
+			request = handler['mutator']['object'].cook(request)
+			# mutate ripe request into response
+			response = handler['mutator']['object'].mutate(request)
+		except:
+			print '[-] Failed to mutate'
+			return
+		try:
+			# they must have the same size, or system will thrash
+			dbg.write(addr, response, request_len)
+		except:
+			print '[-] Failed to write to debuggee'
+			return
 
-		request_display = handler['mutator'].display(request)
-		response_display = handler['mutator'].display(response)
+		request_display = handler['mutator']['object'].display(request)
+		response_display = handler['mutator']['object'].display(response)
 
 		# Strip if too long
 		if len(request_display) > 53:
@@ -179,68 +261,11 @@ class sandbox():
 		if len(response_display) > 53:
 			response_display = response_display[0:50] + '...'
 
-		if handler['addressing'] == 'toesp':
-			print '[+] Param offset to esp %d: %s\n[+] Changed into %s' %
-				(handler['address'], request_display, response_display)
+		if handler['addressing'] in ['esp', 'ebp', 'eax', 'ebx', 'ecx', 'edx', 'esi', 'edi']:
+			print '[+] Param offset to', handler['addressing'], ':', hex(handler['addr']), ':', request_display, '\n[+] Changed into:', response_display
 		elif handler['addressing'] == 'absolute':
-			print '[+] Data at address 0x%x: %s\n[+] Changed into %s' %
-				(handler['address'], request_display, response_display)
+			print '[+] Data at address 0x', hex(handler['addr']), ':', request_display, '\n[+] Changed into:', response_display
 
-		'''
-		display = self.handlers[eip].display
-		if display == '%s':
-			into = self.handlers[eip].into
-			length = len(into)
-			param = dbg.read(addr, length)
-			param = dbg.get_ascii_string(param)
-			print '[+] Param on the stack: %s' % (param[0:20]+'...' if length > 20 else param)
-			print '[+] \tChanged into %s' % (into[0:20]+'...' if length > 20 else into)
-			dbg.write(addr, into, length)
-		elif display == '%d':
-			splited = self.handlers[eip].into.split()
-			n = len(splited)
-			into = hexsed.reformat('d', 'w', splited)
-			length = len(into)
-			into = ''.join(into)
-			param = dbg.read(addr, length)
-			param = ', '.join(struct.unpack('<'+'I'*n, param))
-			print '[+] Param on the stack: %s' % (param[0:20]+'...' if length > 20 else param)
-			print '[+] \tChanged into: %s' % self.handlers[eip].into
-			dbg.write(addr, into, length)
-		elif display == '%l':
-			splited = self.handlers[eip].into.split()
-			n = len(splited)
-			into = hexsed.reformat('d', 'g', splited)
-			length = len(into)
-			into = ''.join(into)
-			param = dbg.read(addr, length)
-			param = ', '.join(map(str, struct.unpack('<'+'L'*n, param)))
-			print '[+] Param on the stack: %s' % (param[0:20]+'...' if length > 20 else param)
-			print '[+] \tChanged into %s' % (self.handlers[eip].into[0:20]+'...' if length>20 else self.handlers[eip].into)
-			dbg.write(addr, into, length)
-		elif display == '%x':
-			splited = self.handlers[eip].into.split()
-			n = len(splited)
-			into = hexsed.reformat('x', 'w', splited)
-			length = len(into)
-			into = ''.join(into)
-			param = dbg.read(addr, length)
-			param = ', 0x'.join(map(str, map(hex, struct.unpack('<'+'I'*n, param))))
-			print '[+] Param on the stack: 0x%s' % (param[0:20]+'...' if length > 20 else param)
-			print '[+] \tChanged into: %s' % (self.handlers[eip].into[0:20]+'...' if length>20 else self.handlers[eip].into)
-			dbg.write(addr, into, length)
-		elif display == '%b':
-			splited = self.handlers[eip].into.split()
-			n = len(splited)
-			into = hexsed.reformat('x', 'b', splited)
-			length = len(into)
-			into = ''.join(into)
-			param = dbg.read(addr, length)
-			param = ', '.join(map(str, map(hex, struct.unpack('<'+'B'*n, param))))
-			print '[+] Param on the stack: 0x%s' % (param[0:20]+'...' if length > 20 else param)
-			print '[+] \tChanged into: %s' % (self.handlers[eip].into[0:20]+'...' if length>20 else self.handlers[eip].into)
-			dbg.write(addr, into, length)
-		'''
 		return DBG_CONTINUE
 
 	# All the prepare work before run.
@@ -254,11 +279,6 @@ class sandbox():
 		else:
 			self.options['oep'] = self.oep_rva + self.base_of_image
 		dbg.bp_set(self.options['oep'], restore=False, handler=self.__oep_handle)
-		# Prepare work of handlers (and the plugins they classified to)
-		for hs in self.handlers.itervalues():
-			for h in hs:
-				if self.plugins[h['util']]['pre_process']:
-					self.plugins[h['util']]['pre_process'](h)
 		return DBG_CONTINUE
 
 	# Still prepare work, (Runtime prepare work)
@@ -270,11 +290,19 @@ class sandbox():
 		# Run-time Dynamic Linking
 		dbg.bp_set(dbg.func_resolve_debuggee('kernel32.dll', 'GetProcAddress'), handler=self.__gpa_handle)
 
-		self.__universal_handle(dbg)
 		#I'll NEED IT ! BECAUSE IF GetProcAddress CALLED WITHOUD UPDATING loaded_modules, IT"S NO USE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 		#loadlibrary = dbg.func_resolve('kernel32.dll', 'LoadLibraryA')
 		#dbg.bp_set(loadlibrary, handler=ll_handle)
 
+		# Prepare work of handlers (and the plugins they classified to)
+		# I put it here because many plugins requires runtime pre_process
+		for hs in self.handlers.itervalues():
+			for h in hs:
+				if self.plugins[h['util']]['pre_process']:
+					self.plugins[h['util']]['pre_process'](h)
+
+		# Some handlers for oep
+		self.__universal_handle(dbg)
 		return DBG_CONTINUE
 
 	def __relocate_addr_loaded_module(self, addr):
@@ -308,21 +336,9 @@ class sandbox():
 			h['collide']['collide_set'] = set()
 			# At the start of trace, thredshold += thredshold_step, so back to real value
 			h['collide']['coverage_incremental_thredshold'] -= h['collide']['thredshold_step']
-		# IT'S AN ADDRESS
 		if 'until' in h:
-			if h['until'].startswith('0x'):
-				h['until'] = int(h['until'][2:], 16)
-			# RUNTIME BREAKPOINT
-			if h['until'] == '@ret':
-				pass
-			# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!RUNTIME TOO!!!!!!!!!!!!!!!!!!!!
-			elif '@' in h['until']:
-				module, func = h['until'].split('@')
-				module = module.lower()
-				h['until'] = sef.dbg.func_resolve_debuggee(module, func)
-			# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!RUNTIME TOO!!!!!!!!!!!!!!!!!!!!
-			else:
-				h['until'] = self.__relocate_addr_loaded_module(h['until'])
+			if not self.breakpoints[h['until']]['passive']:
+				raise
 
 		h.setdefault('visible_modules', [])
 		# Only program visible by default
@@ -333,7 +349,10 @@ class sandbox():
 		h['relay'] = False
 		# Backup the breakpoint of trace, to restore the relayed handler to original
 		# when reached 'until' ( on if 'until' specified)
-		h['bp_backup'] = self.breakpoints[h['bp']]['addr']
+		if self.breakpoints[h['bp']]['resolved']:
+			h['bp_backup'] = self.breakpoints[h['bp']]['addr']
+		else:
+			raise
 
 	# The post process of trace, just dump trace/collide file
 	def __trace_post_process(self, h):
@@ -363,21 +382,24 @@ class sandbox():
 		# Whether met until
 		if 'until' in handler:
 			# IT'S AN ADDRESS
-			if handler['until'] == '@ret':
+			bp = self.breakpoints[handler['until']]
+			if bp['resolved']:
+				if eip == bp['addr']:
+					meet = True
+			elif bp['addr'] == '@ret':
+				# WHAT IF CALLED AND RET AT ONCE!!!!!!!!!!!!!!!!!!!!!!
 				ins = dbg.disasm_around(eip, 0)[0][1]
 				if ins.startswith('ret'):
 					meet = True
-			elif eip == handler['until']:
-				meet = True
 			if meet:
-				print '[+] Traced until: 0x%x\n' % eip
-				# restore the (maybe) relayed handler to the original one
+				# Enable the passive breakpoint to conduct post action
+				bp['time'] = 1
+				print '[+] Traced until: 0x%x' % eip
 				# WRONG !!!!!!!!!!!WHAT IF HARDWARE!!!!!!!!!!!!
-				dbg.bp_del(self.breakpoints[handler['bp']]['addr'])
-				dbg.bp_set(handler['bp_backup'], restore=False, handler=self.__universal_handle)
-				self.breakpoints[handler['bp']]['addr'] = handler['bp_backup']
+				# restore the (maybe) relayed handler to the original one
+				self.__bp_update(self.breakpoints[handler['bp']], handler['bp_backup'], self.__universal_handle, False)
 				if global_handler:
-					self.global_handlers.remove(tmp_handler)
+					self.global_handlers.remove(global_handler)
 				handler['relay'] = False
 				# Mute single_step
 				dbg.single_step(False)
@@ -391,7 +413,7 @@ class sandbox():
 				# A new cycle with an empty collide_set, and a increased thredshold
 				handler['collide']['collide_set'] = set()
 				handler['collide']['coverage_incremental_thredshold'] += handler['collide']['thredshold_step']
-				print '[+] Start colliding, thredshold: %d' % handler['collide']['coverage_incremental_thread']
+				print '[+] Start colliding, thredshold: %d' % handler['collide']['coverage_incremental_thredshold']
 		self.__trace_main(dbg, handler, None)
 		for thread_id in dbg.enumerate_threads():
 			# What's the thread used for???
@@ -406,11 +428,11 @@ class sandbox():
 	def __intercept_handle(self, dbg, handler):
 		pass
 
-	def __trace_handle(self, dbg, tmp_handler):
+	def __trace_handle(self, dbg, global_handler):
 		eip = dbg.context.Eip
-		handler = tmp_handler['orig_handler']
+		handler = global_handler['orig_handler']
 		# If breaked at next instruction successfully
-		if self.__trace_main(self, dbg, handler, tmp_handler):
+		if self.__trace_main(dbg, handler, global_handler):
 			return DBG_CONTINUE
 		# If failed, break at the return address
 		esp = dbg.context.Esp
@@ -421,12 +443,9 @@ class sandbox():
 		if filter(lambda x: x['start']<=ret<=x['end'], map(lambda y:self.loaded_modules[y], handler['visible_modules'])):
 			# Reuse the handler
 			# Trace should never share a breakpoint with others
-			# WRONG !!!!!!!!!!!WHAT IF HARDWARE!!!!!!!!!!!!
-			dbg.bp_del(self.breakpoints[handler['bp']]['addr'])
-			dbg.bp_set(ret, restore=False, handler=self.__universal_handle)
-			self.breakpoints[handler['bp']]['addr'] = ret
+			self.__bp_update(self.breakpoints[handler['bp']], ret, self.__universal_handle, False)
 			handler['relay'] = True
-			self.global_handlers.remove(tmp_handler)
+			self.global_handlers.remove(global_handler)
 			dbg.single_step(False)
 		return DBG_CONTINUE
 
@@ -454,35 +473,42 @@ class sandbox():
 					}
 		# IT'S AN ADDRESS
 		for i, bp in enumerate(self.breakpoints):
-			bp['resolved'] = True
-			if bp['search']:
+			if bp['addr'] == '@oep':
+				bp['addr'] = self.options['oep']
+				bp['name'] = 'OEP'
+				bp['resolved'] = True
+				print '[+] Place breakpoint at %s\t0x%x' % ('oep',bp['addr'])
+			elif bp['addr'] == '@ret':
+				bp['name'] = 'Ret'
+				bp['resolved'] = False
+			elif isinstance(bp['addr'], int):
+				tmp = bp['addr']
+				bp['addr'] = self.__relocate_addr_loaded_module(bp['addr'])
+				'''
+				within = filter(lambda x: x['fake_start']<=bp['addr']<=x['fake_start']+x['end']-x['start'], self.loaded_modules.itervalues())
+				if not within:
+					raise
+				tmp = bp['addr']
+				bp['addr'] = bp['addr'] - within[0]['fake_start'] + within[0]['start']
+				'''
+				bp['name'] = 'Addr'
+				bp['resolved'] = True
+				print '[+] Place breakpoint at\t0x%x --> 0x%x (relocated)' % (tmp, bp['addr'])
+			elif '@' in bp['addr']:
 				module, func = bp['addr'].split('@')
 				module = module.lower()
 				if module in self.loaded_modules:
 					bp['addr'] = self.dbg.func_resolve_debuggee(module, func)
 					bp['name'] = func
 					print '[+] Place breakpoint at %s\t0x%x' % (func, bp['addr'])
+					bp['resolved'] = True
 				else:
 					bp['resolved'] = False
 					continue
-			elif bp['addr'] == '@oep':
-				bp['addr'] = self.options['oep']
-				bp['name'] = 'OEP'
-				print '[+] Place breakpoint at %s\t0x%x' % ('oep',bp['addr'])
-			else:
-				within = filter(lambda x: x['fake_start']<=bp['addr']<=x['fake_start']+x['end']-x['start'], self.loaded_modules.itervalues())
-				if not within:
-					raise
-				tmp = bp['addr']
-				bp['addr'] = bp['addr'] - within[0]['fake_start'] + within[0]['start']
-				print '[+] Place breakpoint at\t0x%x --> 0x%x (relocated)' % (tmp, bp['addr'])
 
-			if not bp['search'] or bp['resolved']:
+			if bp['resolved'] and not bp['passive']:
 				try:
-					if bp['type'] == 'hardware':
-						self.dbg.bp_set_hw(bp['addr'], 1, HW_EXECUTE, handler=self.__universal_handle)
-					else:
-						self.dbg.bp_set(bp['addr'], handler=self.__universal_handle)
+					self.__bp_set(bp, self.__universal_handle)
 				except:
 					print '[-] Failed to place breakpoint\t0x%x' % bp['addr']
 
@@ -492,28 +518,34 @@ class sandbox():
 		# Global handlers have no expire now
 		for h in self.global_handlers:
 			h['handle'](dbg, h)
-		# Get breakpoints at eip
-		for bp in filter(lambda x:x['addr']==eip and x['time']!=0, self.breakpoints):
-			# Get handlers at bp
-			handlers = self.handlers[bp['id']]
-			# Pre actions of all breakpoints
+
+		# Get breakpoints at eip for pre actions
+		for bp in filter(lambda x:(x['addr']==eip or x['passive']) and x['time']!=0, self.breakpoints):
 			if 'pre_action' in bp:
-				self.actions[bp['pre_action']](dbg)
-			# Each handler called once
-			for h in handlers:
-				self.plugins[h['util']]['handler'](dbg, h)
-			# Post actions of all breakpoints
-			if 'post_action' in h:
-				self.actions[bp['post_action']](dbg)
-			# Expire
+				self.__actions[bp['pre_action']](dbg)
+
+		# Get breakpoints at eip for handlers
+		for bp in filter(lambda x:(x['addr']==eip or x['passive']) and x['time']!=0, self.breakpoints):
+			# Get handlers at bp
+			if bp['id'] in self.handlers:
+				handlers = self.handlers[bp['id']]
+				# Each handler called once
+				for h in handlers:
+					self.plugins[h['util']]['handler'](dbg, h)
+
+		# Get breakpoints at eip for post actions (handlers abovev may increase the 'time')
+		for bp in filter(lambda x:(x['addr']==eip or x['passive']) and x['time']!=0, self.breakpoints):
+			if 'post_action' in bp:
+				self.__actions[bp['post_action']](dbg)
+
+		# Expire
+		for bp in filter(lambda x:(x['addr']==eip or x['passive']) and x['time']!=0, self.breakpoints):
 			if bp['time'] > 0:
 				bp['time'] -= 1
 				if bp['time'] == 0:
-					print '[*] Handler expired at: %s\t0x%x' % (bp['name'], bp['addr'])
-					if bp['time'] == 'hardware':
-						self.dbg.bp_del_hw(bp['addr'])
-					else:
-						self.dbg.bp_del(bp['addr'])
+					if not bp['passive']:
+						print '[*] Handler expired at: %s\t0x%x' % (bp['name'], bp['addr'])
+						self.__bp_del(bp['addr'])
 		return DBG_CONTINUE
 
 	# A user interface to dispose all handlers
@@ -524,25 +556,28 @@ class sandbox():
 				if self.plugins[h['util']]['post_process']:
 					self.plugins[h['util']]['post_process'](h)
 
-	# Load .json project file
+	# Load .json project file, and some load-time configure
 	def load_project(self, fname):
 		with open(fname) as f:
 			self.options = json.load(f)
-		if 'breakpoints' in self.breakpoints:
+		if 'breakpoints' in self.options:
 			self.breakpoints = self.options['breakpoints']
 		for i, bp in enumerate(self.breakpoints):
 			if 'addr' not in bp:
 				raise
-			bp.setdefault('search', False)
 			bp.setdefault('name', '')
 			bp.setdefault('action', '')
 			bp.setdefault('time', -1)
 			bp.setdefault('ignore', 0)
 			bp.setdefault('type', 'memory')
+			bp.setdefault('passive', False)
+			if bp['passive']:
+				# When enabled, time change to 1
+				bp['time'] = 0
 			# IT'S AN ADDRESS
-			if not bp["search"]:
-				if type(bp['addr'])!='int' and bp['addr'].startswith('0x'):
-					bp['addr'] = int(bp['addr'][2:], 16)
+			# Only process the hex representation in load time
+			if isinstance(bp['addr'], (str,unicode)) and bp['addr'].startswith('0x'):
+				bp['addr'] = int(bp['addr'][2:], 16)
 		# Index handlers by bp
 		# Hanlders dont't implement much operation here because
 		# 	many options should be determined at runtime

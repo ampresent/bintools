@@ -1,8 +1,8 @@
-
-class heuristic_mutator():
+from mutator import mutator
+class heuristic(mutator):
     def __init__(self, args):
         pass
-    def set_context(self, dbg, handler):
+    def set_context(self, sandbox, dbg, handler):
         pass
     def get_request_len(self):
         pass

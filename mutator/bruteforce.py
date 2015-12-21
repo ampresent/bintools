@@ -1,9 +1,9 @@
 import itertools
-import mutator
+from mutator import mutator
 
-class heuristic_mutator(mutator):
+class bruteforce(mutator):
     def __init__(self, args):
-        super(mutator, self).__init__(args)
+        super(bruteforce, self).__init__(args)
         self.length_now = self.length.next()
         self.mutator = itertools.product(self.charset, repeat=self.length_now)
     def get_request_len(self):
@@ -12,13 +12,13 @@ class heuristic_mutator(mutator):
         return raw
     def mutate(self, ripe):
         try:
-            return self.mutator.next()
+            return ''.join(self.mutator.next())
         except:
             print '[+] try next length'
         try:
-            self.length_now = self.mutator.next()
+            self.length_now = self.length.next()
             self.mutator = itertools.product(self.charset, repeat=self.length_now)
-            return self.mutator.next()
+            return ''.join(self.mutator.next())
         except:
             print '[-] mutator exhausted'
     def display(self, ripe):
