@@ -1,6 +1,4 @@
 Priority:
-    Cross-Platform
-    Reference count for Option. To save space.
     SIGTTIN when debugging the debugger and debuggee reads from stdin
 Sandbox
     Breakpoint for new thread
@@ -10,15 +8,13 @@ Sandbox
     Pattern Match, Return value capture for Man in the Middle
     Sub process must be able to passed into arguments. Especially for Unix like
     Anti-Reversing for sandox. Avoid being analysed by other hackers.
+    Mutator:
+        genetic algorithm
 Emulator
 Monitor
     Check Alive
 Bomber
-Entropy character
-    Gray-box fuzzing, a ranking factor for genetic algorithm( Not for now, before thoroughly understand fuzzing )
 
-Allow for multiple costomizing hanlers, through config file
-Locating the issue causing false IAT. Why so many false IAT?
 Exception
 Command Options(-n for times, -d disable, -p process(handling params), -l log, -c crash_report)
 Distinguish functions with the same name in different libraries

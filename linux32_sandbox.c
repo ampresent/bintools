@@ -26,6 +26,9 @@
 #define UTILITY_TRACE     3
 #define GLOBAL_REPAIR     4
 
+#define API_TYPE_NORMAL   0
+#define API_TYPE_PLT      1
+
 #define MAX_HASH          65536
 
 // When we need to traverse though list as well as
@@ -38,6 +41,7 @@
 */
 #define GET(p, a) ((*(p))->a)
 
+// The priority of ptrace signals
 unsigned priorityarray[] = {
     UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX,
     5,//PTRACE_CONT 7
@@ -50,28 +54,36 @@ unsigned priorityarray[] = {
     2,//PTRACE_SYSCALL 24
 };
 
+// The macro to determin the prior one
 #define PRIORITY(pr1,pr2) (priorityarray[(pr1)]<priorityarray[(pr2)]?(pr1):(pr2))
+// The macro to get hash entry out of ip
 #define GETID(ip) ((ip)&((MAX_HASH)-1))
-
+// The Moudle struture, now used by trace
 struct Module{
     unsigned base;
     unsigned length;
     struct Module* next_module;
 };
 
+// Trace Option
 struct TraceOption{
     FILE* file;
     struct Module* whitelist;
 };
 
+// Disable option
 struct DisableOption{
-
+    // How does disable module disable api
+    // Jmp to ret / Jmp to [esp]
+    unsigned char api_type; // normal: 0, plt: 1
 };
 
+// MITM option (not supported yet)
 struct MITMOption{
 
 };
 
+// The header of option
 struct Option{
     UTILITY_TYPE utility;
     unsigned life;
@@ -83,6 +95,7 @@ struct Option{
     };
 };
 
+// The Handler (global & bind)
 struct Handler{
     unsigned ip;                     // Address asscociated with the Handler. If global_flag specified, ip = 0
     unsigned backup;                 // Backup of the memory on the breakpoint
@@ -93,9 +106,10 @@ struct Handler{
     struct Handler* prev_handler;    // Pointer to next handler on the list
 };
 
-// It's a stack. FILO
-struct Handler *handlers[MAX_HASH], *global_handler;
-struct Handler* handler_p, *next_handler;
+// hash table of handlers combinded to ip
+struct Handler *handlers[MAX_HASH];
+// global handlers (mainly used for single step)
+struct Handler *global_handler;
 struct Module* whitelist, *module_h, *next_module;
 struct Option* options, *option_h, *next_option;
 
@@ -186,6 +200,13 @@ struct Option* get_trace_option(FILE* file, struct Module* whitelist){
     no = get_option(UTILITY_TRACE, 1);
     no -> trace_option.file = file;
     no -> trace_option.whitelist = whitelist;
+    return no;
+}
+
+struct Option* get_disable_option(unsigned char api_type){
+    struct Option* no;
+    no = get_option(UTILITY_DISABLE, 1);
+    no -> disable_option.api_type = api_type;
     return no;
 }
 
@@ -280,6 +301,31 @@ enum __ptrace_request trace(pid_t pid, struct Handler* handler){
     }
 }
 
+enum __ptrace_request disable(pid_t pid, struct Handler* handler_p){
+    unsigned ip;
+    struct user_regs_struct regs;
+    char inst_str[128];
+    int len = 0;
+    Ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+    ip = regs.eip;
+    switch(handler_p->option->disable_option.api_type){
+        case API_TYPE_NORMAL:
+            // SHOULT DETECT ELAPPED HERE.
+            do{
+                ip += len;
+                len = get_single_instruction_at(pid, ip, inst_str, 128);
+            }while (!strncmp(inst_str, "ret", 3));
+            regs.eip = ip;
+            Ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+            return PTRACE_CONT;
+        case API_TYPE_PLT:
+            ip = Ptrace(PTRACE_PEEKTEXT, pid, (void*)regs.esp, NULL);
+            regs.eip = ip;
+            Ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+            return PTRACE_CONT;
+    }
+}
+
 void bp_hide(pid_t pid, struct Handler* handler_p){
     unsigned backup, ip;
     backup = handler_p -> backup;
@@ -310,7 +356,7 @@ enum __ptrace_request dispatch(pid_t pid, struct Handler* handler_p){
     pr = PTRACE_CONT;
     switch (handler_p -> option -> utility){
         case UTILITY_DISABLE:
-            pr = PTRACE_CONT;
+            pr = disable(pid, handler_p);
             break;
         case UTILITY_MITM:
             pr = PTRACE_CONT;
@@ -419,15 +465,7 @@ void finalize(){
     }
 }
 int main(){
-    //unsigned i;
-    //int len;
-    //int offset;
-    //unsigned ban;
-    //unsigned bp;
-    //unsigned backup;
-    //unsigned addr;
-    //unsigned data;
-    //unsigned buff;
+    struct Handler *handler_p, *next_handler;
     unsigned hid;
     unsigned oep;
     // This is NOT THE PROPER WAY!!!
@@ -454,8 +492,6 @@ int main(){
         execl(prog, prog, NULL);
     }else if (pid > 0){
         oep = get_entry_point(prog);
-        // Test
-        oep = 0x080484a1;
         // On loaded
         wait(&wait_status);
         if (WIFSTOPPED(wait_status)){
@@ -464,6 +500,7 @@ int main(){
             baseaddr = get_baseaddr(prog);
             add_module(&whitelist, baseaddr, memsize);
             get_handler(pid, oep, get_trace_option(fopen("/tmp/trace","w"), whitelist));
+            get_handler(pid, 0x8048380, get_disable_option(API_TYPE_PLT));
             Ptrace(PTRACE_CONT, pid, NULL, NULL);
         }
 
@@ -498,111 +535,9 @@ int main(){
                 pr2 = expire(pid, handler_p, hid, &next_handler);
                 pr = PRIORITY(pr, pr2);
             }
-            /*
-            // A global handler deals with more general problem
-            // Like breakpoint restoring
-            ITER_WITH_ADD(handler_pp, global_handler, next_handler, delay){
-                pr2 = dispatch(pid, *handler_pp);
-                pr = PRIORITY(pr, pr2);
-            }
-            ITER_WITH_DEL(handler_pp, global_handler, next_handler, proceed){
-                pr2 = global_expire(pid, handler_pp, &delay);
-                pr = PRIORITY(pr, pr2);
-            }
-
-            ITER_WITH_ADD(handler_pp, handlers[hid], next_handler, proceed){
-                pr2 = dispatch(pid, *handler_pp);
-                pr = PRIORITY(pr, pr2);
-            }
-            ITER_WITH_DEL(handler_pp, handlers[hid], next_handler, proceed){
-                pr2 = expire(pid, handler_pp, &delay);
-                pr = PRIORITY(pr, pr2);
-            }
-            */
             Ptrace(pr, pid, NULL, NULL);
             wait(&wait_status);
         }
-
-        /*
-        wait(&wait_status);
-
-        if (WIFSTOPPED(wait_status)){
-            bp = oep;
-            backup = Ptrace(PTRACE_PEEKTEXT, pid, (void*)bp, NULL);
-            buff = (backup&0xffffff00u)|0xccu;
-            Ptrace(PTRACE_POKETEXT, pid, (void*)bp, (void*)buff);
-            Ptrace(PTRACE_CONT, pid, NULL, NULL);
-            wait(&wait_status);
-        }
-
-        // Break at Entry Point, I'm not sure of the need to break at oep
-        if (WIFSTOPPED(wait_status)){
-            Ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-            regs.eip -= 1;
-            Ptrace(PTRACE_SETREGS, pid, NULL, &regs);
-            // Restore
-            Ptrace(PTRACE_POKETEXT, pid, (void*)bp, (void*)backup);
-
-            if (indirect){
-                bp = Ptrace(PTRACE_PEEKTEXT, pid, (void*)ban, NULL);
-            }else{
-                bp = ban;
-            }
-
-            backup = Ptrace(PTRACE_PEEKTEXT, pid, (void*)bp, NULL);
-
-            buff = (backup&0xffffff00)|0xCC;
-
-            Ptrace(PTRACE_POKETEXT, pid, (void*)bp, (void*)buff);
-            Ptrace(PTRACE_CONT, pid, NULL, NULL);
-            wait(&wait_status);
-        }
-
-        while (!WIFEXITED(wait_status) && WIFSTOPPED(wait_status)){
-            Ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-            if (regs.eip == bp + 1){
-                regs.eip -= 1;
-                Ptrace(PTRACE_SETREGS, pid, NULL, &regs);
-                // BUT THIS MAKES THE BREAKPOINT INVALID, SO WHILE NO USE!!!
-                // CORRECT THIS LATAR
-                Ptrace(PTRACE_POKETEXT, pid, (void*)regs.eip, (void*)backup);
-
-                if (mitm){
-                    if (plt || manual){
-
-                    }else{
-
-                    }
-                }
-                else if (disable){
-                    if (plt || manual){
-                        backup = Ptrace(PTRACE_PEEKTEXT, pid, (void*)regs.eip, NULL);
-                        if (plt || pop==0)
-                            buff = (backup & 0xffffff00) | 0xc3;
-                        else
-                            buff = (backup & 0xff000000) | 0xc2 | ((pop<<8)&0xffff00);
-                        // Seems don't need to restore
-                        Ptrace(PTRACE_POKETEXT, pid, (void*)regs.eip, (void*)buff);
-                        Ptrace(PTRACE_CONT, pid, NULL, NULL);
-                    }else{
-                        // An automatic approach
-                        offset = 0;
-                        data = Ptrace(PTRACE_PEEKTEXT, pid, (void*)(regs.eip+offset), NULL);
-                        len = get_single_instruction_word(data, inst_str, 128);
-                        while (strncmp(inst_str, "retn", 4) && strncmp(inst_str, "ret", 3)){
-                            offset += len;
-                            data = Ptrace(PTRACE_PEEKTEXT, pid, (void*)(regs.eip+offset), NULL);
-                            len = get_single_instruction_word(data, inst_str, 128);
-                        }
-                        regs.eip += offset;
-                        Ptrace(PTRACE_SETREGS, pid, NULL, &regs);
-                        Ptrace(PTRACE_CONT, pid, NULL, NULL);
-                    }
-                }
-            }
-            wait(&wait_status);
-        }
-        */
     }else{
         perror("Folk failed: ");
         exit(-1);
