@@ -34,15 +34,26 @@ class sandbox():
 		self._register_new_plugin('mitm', self.__mitm_handle, self.__mitm_pre_process, None)
 		self._register_new_plugin('intercept', self.__intercept_handle, None, None)
 		self.__actions = {'snapshot': self.__take_snapshot ,'restore': self.__restore_snapshot}
-	
+
 	# ADDR TO MODULE METHOD OF PYDBG!!!!!!!!!!!!!!!!!!!!!
 
 	def __take_snapshot(self, dbg):
-		# THIS DIDN'T EXECUTE???????????????
 		# ALL THREADS SUSPENDED????????!!!!!!!!!!!!!!!
+		dbg.suspend_all_threads()
 		dbg.process_snapshot()
+		dbg.resume_all_threads()
+		print hex(dbg.memory_snapshot_contexts[0].context.Eip)
 	def __restore_snapshot(self, dbg):
+		# Why failed to restore?????????
+		print 'restore:'
+		print '  snapshot:', hex(dbg.memory_snapshot_contexts[0].context.Eip)
+		print '  eip     :', hex(dbg.context.Eip)
+		dbg.suspend_all_threads()
+		dbg.set_thread_context(dbg.memory_snapshot_contexts[0].context)
 		dbg.process_restore()
+		dbg.resume_all_threads()
+		print '  new eip :', hex(dbg.context.Eip)
+		print '  new snap:', dbg.memory_snapshot_contexts
 
 	# Register new plugins, can be called in child class, to extend the functionality
 	def _register_new_plugin(self, name, handle, pre_process, post_process):
@@ -82,7 +93,7 @@ class sandbox():
 			except:
 				print '[-] Invalied mutator or argument'
 				exit(1)
-	
+
 	def __bp_del(self, bp):
 		if bp['time'] == 'hardware':
 			self.dbg.bp_del_hw(bp['addr'])
@@ -524,12 +535,12 @@ class sandbox():
 			h['handle'](dbg, h)
 
 		# Get breakpoints at eip for pre actions
-		for bp in filter(lambda x:(x['addr']==eip or x['passive']) and x['time']!=0, self.breakpoints):
+		for bp in filter(lambda x:(x['addr']==eip or x['passive']) and x['time']!=0 and x['ignore']==0, self.breakpoints):
 			if 'pre_action' in bp:
 				self.__actions[bp['pre_action']](dbg)
 
 		# Get breakpoints at eip for handlers
-		for bp in filter(lambda x:(x['addr']==eip or x['passive']) and x['time']!=0, self.breakpoints):
+		for bp in filter(lambda x:(x['addr']==eip or x['passive']) and x['time']!=0 and x['ignore']==0, self.breakpoints):
 			# Get handlers at bp
 			if bp['id'] in self.handlers:
 				handlers = self.handlers[bp['id']]
@@ -538,18 +549,23 @@ class sandbox():
 					self.plugins[h['util']]['handler'](dbg, h)
 
 		# Get breakpoints at eip for post actions (handlers abovev may increase the 'time')
-		for bp in filter(lambda x:(x['addr']==eip or x['passive']) and x['time']!=0, self.breakpoints):
+		for bp in filter(lambda x:(x['addr']==eip or x['passive']) and x['time']!=0 and x['ignore']==0, self.breakpoints):
 			if 'post_action' in bp:
 				self.__actions[bp['post_action']](dbg)
 
 		# Expire
-		for bp in filter(lambda x:(x['addr']==eip or x['passive']) and x['time']!=0, self.breakpoints):
-			if bp['time'] > 0:
-				bp['time'] -= 1
-				if bp['time'] == 0:
-					if not bp['passive']:
-						print '[*] Handler expired at: %s\t0x%x' % (bp['name'], bp['addr'])
-						self.__bp_del(bp['addr'])
+		for bp in filter(lambda x:(x['addr']==eip or x['passive']) and x['time']>0 and x['ignore']==0, self.breakpoints):
+			bp['time'] -= 1
+			if bp['time'] == 0:
+				if not bp['passive']:
+					print '[*] Handler expired at: %s\t0x%x' % (bp['name'], bp['addr'])
+					self.__bp_del(bp['addr'])
+
+		# Ignore decrease
+		for bp in filter(lambda x:x['addr']==eip and x['ignore']>0, self.breakpoints):
+			bp['ignore'] -= 1
+			if bp['ignore'] == 0:
+				print '[+] Breakpoint (%d) actived: 0x%x' % (bp['id'], bp['addr'])
 		return DBG_CONTINUE
 
 	# A user interface to dispose all handlers
@@ -576,8 +592,9 @@ class sandbox():
 			bp.setdefault('type', 'memory')
 			bp.setdefault('passive', False)
 			if bp['passive']:
-				# When enabled, time change to 1
+				# When enabled, time forced 0, ignore forced 0
 				bp['time'] = 0
+				bp['ignore'] = 0
 			# IT'S AN ADDRESS
 			# Only process the hex representation in load time
 			if isinstance(bp['addr'], (str,unicode)) and bp['addr'].startswith('0x'):
