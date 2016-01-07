@@ -1,4 +1,5 @@
-from pydbg import *
+from mydbg import *
+#from pydbg import *
 from pydbg.defines import *
 import pefile
 import sys
@@ -19,7 +20,7 @@ class sandbox():
 		self.breakpoints = []
 		self.handlers = []
 		self.global_handlers = []
-		self.dbg = pydbg()
+		self.dbg = mydbg()
 		self.plugins = {}
 
 		# The starting work
@@ -42,18 +43,11 @@ class sandbox():
 		dbg.suspend_all_threads()
 		dbg.process_snapshot()
 		dbg.resume_all_threads()
-		print hex(dbg.memory_snapshot_contexts[0].context.Eip)
 	def __restore_snapshot(self, dbg):
 		# Why failed to restore?????????
-		print 'restore:'
-		print '  snapshot:', hex(dbg.memory_snapshot_contexts[0].context.Eip)
-		print '  eip     :', hex(dbg.context.Eip)
 		dbg.suspend_all_threads()
-		dbg.set_thread_context(dbg.memory_snapshot_contexts[0].context)
 		dbg.process_restore()
 		dbg.resume_all_threads()
-		print '  new eip :', hex(dbg.context.Eip)
-		print '  new snap:', dbg.memory_snapshot_contexts
 
 	# Register new plugins, can be called in child class, to extend the functionality
 	def _register_new_plugin(self, name, handle, pre_process, post_process):
@@ -341,12 +335,16 @@ class sandbox():
 		if 'collide' in h:
 			h['collide'].setdefault('coverage_incremental_thredshold', 5)
 			h['collide'].setdefault('thredshold_step', 0)
+			h['collide'].setdefault('mute', False)
 			if 'file' not in h['collide']:
 				raise
-			with open(h['collide']['file']) as f:
-				# Read trace rva into orig_coverage as a set
-				h['collide']['orig_coverage'] = set(map(lambda x:int(x.strip().split('\t')[1]), f.read().strip().split('\n')))
-				print '[+] Reference coverage information loaded: %s' % h['collide']['file']
+			try:
+				with open(h['collide']['file']) as f:
+					# Read trace rva into orig_coverage as a set
+					h['collide']['orig_coverage'] = set(map(lambda x:int(x.strip().split('\t')[1]), f.read().strip().split('\n')))
+					print '[+] Reference coverage information loaded: %s' % h['collide']['file']
+			except:
+				h['collide']['orig_coverage'] = set()
 			# Clean the collide_set
 			h['collide']['collide_set'] = set()
 			# At the start of trace, thredshold += thredshold_step, so back to real value
@@ -388,12 +386,12 @@ class sandbox():
 		handler['inst_stream_rva'].append(eip-within[0]['start'])
 		dbg.single_step(True)
 		meet = False
-		if 'collide' in handler:
+		if 'collide' in handler and not handler['collide']['mute']:
 			handler['collide']['collide_set'].add(eip-within[0]['start'])
 			if len(handler['collide']['collide_set'] - handler['collide']['orig_coverage']) > handler['collide']['coverage_incremental_thredshold']:
 				print '[!] Coverage incremental thredshold exceeded!\n\tAnd overlapped 0x%x!' % eip
 				# if collide successfully, mute in advance
-				meet = True
+				handler['collide']['mute'] = True
 		# Whether met until
 		if 'until' in handler:
 			# IT'S AN ADDRESS
@@ -404,7 +402,7 @@ class sandbox():
 			elif bp['addr'] == '@ret':
 				# WHAT IF CALLED AND RET AT ONCE!!!!!!!!!!!!!!!!!!!!!!
 				ins = dbg.disasm_around(eip, 0)[0][1]
-				if ins.startswith('ret'):
+				if ins.startswith('ret') and 'collide' in handler:
 					meet = True
 			if meet:
 				# Enable the passive breakpoint to conduct post action
@@ -422,6 +420,7 @@ class sandbox():
 	# The real handle of trace, which will start a sub-handler (global)
 	def __trace_start_handle(self, dbg, handler):
 		eip = dbg.context.Eip
+		# DEPRECATED????????????????
 		if not handler['relay']:
 			print '[+] Start tracing at: 0x%x' % eip
 			if 'collide' in handler:
@@ -429,6 +428,9 @@ class sandbox():
 				handler['collide']['collide_set'] = set()
 				handler['collide']['coverage_incremental_thredshold'] += handler['collide']['thredshold_step']
 				print '[+] Start colliding, thredshold: %d' % handler['collide']['coverage_incremental_thredshold']
+		if 'collide' in handler:
+			# Turn on collide every time reaching entry point (Turned off once exceeded)
+			handler['collide']['mute'] = False
 		self.__trace_main(dbg, handler, None)
 		for thread_id in dbg.enumerate_threads():
 			# What's the thread used for???
@@ -559,7 +561,7 @@ class sandbox():
 			if bp['time'] == 0:
 				if not bp['passive']:
 					print '[*] Handler expired at: %s\t0x%x' % (bp['name'], bp['addr'])
-					self.__bp_del(bp['addr'])
+					self.__bp_del(bp)
 
 		# Ignore decrease
 		for bp in filter(lambda x:x['addr']==eip and x['ignore']>0, self.breakpoints):
