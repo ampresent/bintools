@@ -60,9 +60,7 @@ class mutator(object):
     # Return -1 if it's undetermined
     def get_request_len(self):
         pass
-    def cook(self, raw):
+    def mutate(self, raw):
         pass
-    def mutate(self, ripe):
-        pass
-    def display(self, ripe):
+    def display(self, raw):
         pass

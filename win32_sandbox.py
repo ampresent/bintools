@@ -11,6 +11,7 @@ import json
 import itertools
 import operator
 import mutator
+import traceback
 
 # Handler should have its ID too!!!!
 # For convinience of module connection like mitm - trace !!!!
@@ -34,9 +35,12 @@ class sandbox():
 		self._register_new_plugin('trace', self.__trace_start_handle, self.__trace_pre_process, self.__trace_post_process)
 		self._register_new_plugin('mitm', self.__mitm_handle, self.__mitm_pre_process, None)
 		self._register_new_plugin('intercept', self.__intercept_handle, None, None)
-		self.__actions = {'snapshot': self.__take_snapshot ,'restore': self.__restore_snapshot}
+		self.__actions = {'snapshot': self.__take_snapshot ,'restore': self.__restore_snapshot, 'alert': self.__alert}
 
 	# ADDR TO MODULE METHOD OF PYDBG!!!!!!!!!!!!!!!!!!!!!
+
+	def __alert(self, dbg):
+		print '[!] Running through 0x%x' % dbg.context.Eip
 
 	def __take_snapshot(self, dbg):
 		# ALL THREADS SUSPENDED????????!!!!!!!!!!!!!!!
@@ -78,13 +82,14 @@ class sandbox():
 
 	def __mitm_pre_process(self, handler):
 		if 'mutator' not in handler:
-			'[-] Invalid mutator'
+			print '[-] Invalid mutator'
 			raise
 		handler['mutator'].setdefault('args', {})
 		if 'name' not in handler:
 			try:
 				handler['mutator']['object'] = getattr(mutator, handler['mutator']['name'])(handler['mutator']['args'])
-			except:
+			except Exception, e:
+				print e
 				print '[-] Invalied mutator or argument'
 				exit(1)
 
@@ -187,93 +192,142 @@ class sandbox():
 	def __mitm_handle(self, dbg, handler):
 		# I need to only observe too!!!!!!!!!!!!!!!!!!
 		eip = dbg.context.Eip
+		print '[+] Mutating at 0x%x' % eip
 		# two addressing method now. Offset to xxx / Absolute VA
-		if handler['addressing'] == 'esp':
-			base = dbg.context.Esp
-			# IT'S AN ADDRESS
-			addr = base + handler['addr']
-		if handler['addressing'] == 'ebp':
-			base = dbg.context.Ebp
-			addr = base + handler['addr']
-		elif handler['addressing'] == 'eax':
-			base = dbg.context.Eax
-			addr = base + handler['addr']
-		elif handler['addressing'] == 'ebx':
-			base = dbg.context.Ebx
-			addr = base + handler['addr']
-		elif handler['addressing'] == 'ecx':
-			base = dbg.context.Ecx
-			addr = base + handler['addr']
-		elif handler['addressing'] == 'edx':
-			base = dbg.context.Edx
-			addr = base + handler['addr']
-		elif handler['addressing'] == 'esi':
-			base = dbg.context.Esi
-			addr = base + handler['addr']
-		elif handler['addressing'] == 'edi':
-			base = dbg.context.Edi
-			addr = base + handler['addr']
-		elif handler['addressing'] == 'absolute':
-			# WRONG!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-			# ALL ADDRESS INPUT FROM PROJ FILE SHOULD BE RELOCATED!!!!!!!!!!!!!!!!!!!!!!!!!
-			# IT'S AN ADDRESS
-			addr = handler['addr']
-		else:
-			raise
-		# If indirect specified , lookup address
-		# THIS DIRECT IS INDIRECT ALREADY!!!!!!!!!!!!!!!!!!!!!!!! I SHOULD MODIFY REGISTERS DIRECTLY !!!!
-		if handler['indirect']:
-			addr = struct.unpack('<I', dbg.read(addr, 4))[0]
-
-		# I SHOULD SUPPORT EXTERNAL STORAGE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
-		# mutator should be imported, and INSTANCTIATED!!! duaring __mitm_pre_process
-
-		# provide sufficient context infomation for mutator
-		# SO MITM MODULE CARRYING SOME SPECIFIC MUTATOR MUST BE PUT BEFORE TRACE MODULE,
-		# OR TRACE MODULE WILL ERASE THE COLLIDE_SET AT FIRST!!!!!!!!!!!!!
-		# I SHOULD PROVIDE PLAIN TEXT BESIDES MUTATOR!!!!!!!!!!!
-		try:
-			handler['mutator']['object'].set_context(self, dbg, handler)
-			# get request len from mutator
-			request_len = handler['mutator']['object'].get_request_len()
-			# request memory from debuggee
-			if request_len == -1:
-				request = dbg.smart_dereference(addr, True)
-				request_len = len(request)
+		if handler['addressing'] == 'register':
+			if handler['addr'] == 'esp':
+				addr = dbg.context.Esp
+			elif handler['addr'] == 'ebp':
+				addr = dbg.context.Ebp
+			elif handler['addr'] == 'eax':
+				addr = dbg.context.Eax
+			elif handler['addr'] == 'ebx':
+				addr = dbg.context.Ebx
+			elif handler['addr'] == 'ecx':
+				addr = dbg.context.Ecxc
+			elif handler['addr'] == 'edx':
+				addr = dbg.context.Edx
+			elif handler['addr'] == 'esi':
+				addr = dbg.context.Esi
+			elif handler['addr'] == 'edi':
+				addr = dbg.context.Edi
 			else:
-				request = dbg.read(addr, request_len)
-		except:
-			print '[-] Failed to read from debuggee'
-			return
-		try:
-			# get ripe request out of raw
-			request = handler['mutator']['object'].cook(request)
-			# mutate ripe request into response
-			response = handler['mutator']['object'].mutate(request)
-		except:
-			print '[-] Failed to mutate'
-			return
-		try:
-			# they must have the same size, or system will thrash
-			dbg.write(addr, response, request_len)
-		except:
-			print '[-] Failed to write to debuggee'
-			return
+				raise
 
-		request_display = handler['mutator']['object'].display(request)
-		response_display = handler['mutator']['object'].display(response)
+		if handler['addressing'] == 'register' and 'indirect' not in handler:
+			# mutator only possesses bytes, so translate into bytes
+			request = struct.pack('<I', addr)
+			request_len = 4
+			handler['mutator']['object'].set_context(self, dbg, handler)
+			try:
+				# get ripe request out of raw
+				request_display = handler['mutator']['object'].display(request)
+				# mutate ripe request into response
+				response = handler['mutator']['object'].mutate(request)
+				response_display = handler['mutator']['object'].display(response)
+			except:
+				print '[-] Failed to mutate'
+				return
+			try:
+				# retranslate into number from bytes
+				self.dbg.set_register(handler['addr'].upper(), struct.unpack('<I', response)[0])
+			except:
+				print '[-] Failed to write to debuggee'
+				return
+			addr_display = handler['addr']
+			print '[+] Data at %s: %s\n[+] Changed into: %s' % (addr_display,  request_display, response_display)
+		else:
+			if handler['addressing'] == 'esp':
+				base = dbg.context.Esp
+				# IT'S AN ADDRESS
+				addr = base + handler['addr']
+			if handler['addressing'] == 'ebp':
+				base = dbg.context.Ebp
+				addr = base + handler['addr']
+			elif handler['addressing'] == 'eax':
+				base = dbg.context.Eax
+				addr = base + handler['addr']
+			elif handler['addressing'] == 'ebx':
+				base = dbg.context.Ebx
+				addr = base + handler['addr']
+			elif handler['addressing'] == 'ecx':
+				base = dbg.context.Ecx
+				addr = base + handler['addr']
+			elif handler['addressing'] == 'edx':
+				base = dbg.context.Edx
+				addr = base + handler['addr']
+			elif handler['addressing'] == 'esi':
+				base = dbg.context.Esi
+				addr = base + handler['addr']
+			elif handler['addressing'] == 'edi':
+				base = dbg.context.Edi
+				addr = base + handler['addr']
+			elif handler['addressing'] == 'absolute':
+				# WRONG!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+				# ALL ADDRESS INPUT FROM PROJ FILE SHOULD BE RELOCATED!!!!!!!!!!!!!!!!!!!!!!!!!
+				# IT'S AN ADDRESS
+				addr = handler['addr']
+			elif handler['addressing'] == 'register':
+				pass
+			else:
+				raise
+			# If indirect specified , lookup address
+			# THIS DIRECT IS INDIRECT ALREADY!!!!!!!!!!!!!!!!!!!!!!!! I SHOULD MODIFY REGISTERS DIRECTLY !!!!
+			if 'indirect' in handler:
+				addr = struct.unpack('<I', dbg.read(addr, 4))[0] + handler['indirect']
 
-		# Strip if too long
-		if len(request_display) > 53:
-			request_display = request_display[0:50] + '...'
-		if len(response_display) > 53:
-			response_display = response_display[0:50] + '...'
+			# I SHOULD SUPPORT EXTERNAL STORAGE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-		if handler['addressing'] in ['esp', 'ebp', 'eax', 'ebx', 'ecx', 'edx', 'esi', 'edi']:
-			print '[+] Param offset to', handler['addressing'], ':', hex(handler['addr']), ':', request_display, '\n[+] Changed into:', response_display
-		elif handler['addressing'] == 'absolute':
-			print '[+] Data at address 0x', hex(handler['addr']), ':', request_display, '\n[+] Changed into:', response_display
+			# mutator should be imported, and INSTANCTIATED!!! duaring __mitm_pre_process
+
+			# provide sufficient context infomation for mutator
+			# SO MITM MODULE CARRYING SOME SPECIFIC MUTATOR MUST BE PUT BEFORE TRACE MODULE,
+			# OR TRACE MODULE WILL ERASE THE COLLIDE_SET AT FIRST!!!!!!!!!!!!!
+			# I SHOULD PROVIDE PLAIN TEXT BESIDES MUTATOR!!!!!!!!!!!
+			try:
+				handler['mutator']['object'].set_context(self, dbg, handler)
+				# get request len from mutator
+				request_len = handler['mutator']['object'].get_request_len()
+				# request memory from debuggee
+				if request_len == -1:
+					request = dbg.smart_dereference(addr, True)
+					request_len = len(request)
+				else:
+					request = dbg.read(addr, request_len)
+			except:
+				print '[-] Failed to read from debuggee'
+				return
+			try:
+				# get ripe request out of raw
+				request_display = handler['mutator']['object'].display(request)
+				# mutate ripe request into response
+				response = handler['mutator']['object'].mutate(request)
+				response_display = handler['mutator']['object'].display(response)
+			except:
+				print '[-] Failed to mutate'
+				return
+			try:
+				# they must have the same size, or system will thrash
+				dbg.write(addr, response, request_len)
+			except:
+				print '[-] Failed to write to debuggee'
+				return
+
+			# Strip if too long
+			if len(request_display) > 53:
+				request_display = request_display[0:50] + '...'
+			if len(response_display) > 53:
+				response_display = response_display[0:50] + '...'
+
+			if handler['addressing'] in ['esp', 'ebp', 'eax', 'ebx', 'ecx', 'edx', 'esi', 'edi']:
+				addr_display = '[%s%c%d]' % (handler['addressing'], '+' if handler['addr']>=0 else '', handler['addr'])
+			elif handler['addressing'] == 'absolute':
+				addr_display = hex(handler['addr'])
+			elif handler['addressing'] == 'register' :
+				addr_display = handler['addr']
+			if 'indirect' in handler:
+				addr_display = '[%s%c%xh]' % (arr_display, '+' if handler['indirect']>=0 else '', handler['indirect'])
+			print '[+] Data at %s: %s\n[+] Changed into: %s' % (addr_display,  request_display, response_display)
 
 		return DBG_CONTINUE
 
